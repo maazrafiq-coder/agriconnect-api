@@ -1,0 +1,885 @@
+// prisma/schema.prisma
+// AgriConnect Pakistan — Full Database Schema (v2 — relation-consistent)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── ENUMS ────────────────────────────────────────────────────────────────────
+
+enum UserRole {
+  FARMER
+  TRADER
+  MILLER
+  EXPORTER
+  BUYER
+  TRANSPORTER
+  WAREHOUSE
+  TESTING_AGENCY
+  BANK
+  INSURANCE
+  INVESTOR
+  ADMIN
+}
+
+enum KycStatus {
+  PENDING
+  SUBMITTED
+  APPROVED
+  REJECTED
+}
+
+enum ProductCategory {
+  RICE
+  PADDY
+  WHEAT
+  MAIZE
+  COTTON
+  SUGARCANE
+  PULSES
+  OIL_SEEDS
+  FRUITS
+  VEGETABLES
+  LIVESTOCK_FEED
+  OTHER
+}
+
+enum RiceStage {
+  PADDY
+  BROWN_RICE
+  MILLED_WHITE
+  WHITE_RICE
+  PARBOILED
+}
+
+enum ProductStatus {
+  DRAFT
+  ACTIVE
+  UNDER_OFFER
+  SOLD
+  PAUSED
+  REMOVED
+}
+
+enum OfferStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+  COUNTERED
+  EXPIRED
+  WITHDRAWN
+}
+
+enum OrderStatus {
+  PENDING
+  CONFIRMED
+  IN_TRANSIT
+  DELIVERED
+  COMPLETED
+  CANCELLED
+  DISPUTED
+}
+
+enum PaymentStatus {
+  UNPAID
+  PARTIAL
+  PAID
+  REFUNDED
+  FAILED
+}
+
+enum TransactionType {
+  ORDER_PAYMENT
+  STORAGE_FEE
+  TESTING_FEE
+  TRANSPORT_FEE
+  INSURANCE_PREMIUM
+  LOAN_DISBURSEMENT
+  LOAN_REPAYMENT
+  PLATFORM_FEE
+  REFUND
+}
+
+enum WarehouseType {
+  COLD_STORAGE
+  DRY_STORAGE
+  CONTROLLED_ATMOSPHERE
+  BONDED
+}
+
+enum ReceiptStatus {
+  ACTIVE
+  UNDER_LIEN
+  RELEASED
+  EXPIRED
+}
+
+enum LienStatus {
+  ACTIVE
+  RELEASED
+  DEFAULTED
+}
+
+enum TestingStatus {
+  REQUESTED
+  ASSIGNED
+  SAMPLE_COLLECTED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum TransportStatus {
+  REQUESTED
+  QUOTED
+  BOOKED
+  PICKED_UP
+  IN_TRANSIT
+  DELIVERED
+  CANCELLED
+}
+
+enum VehicleType {
+  SMALL_TRUCK
+  MEDIUM_TRUCK
+  LARGE_TRUCK
+  CONTAINER
+  BULK_CARGO
+  REFRIGERATED
+}
+
+enum NotificationType {
+  ORDER_UPDATE
+  OFFER_RECEIVED
+  OFFER_ACCEPTED
+  OFFER_REJECTED
+  PAYMENT_RECEIVED
+  PAYMENT_DUE
+  TESTING_UPDATE
+  TRANSPORT_UPDATE
+  WAREHOUSE_UPDATE
+  KYC_UPDATE
+  LOAN_UPDATE
+  SYSTEM
+}
+
+// ─── USER & IDENTITY ──────────────────────────────────────────────────────────
+// Rule: User owns identity only. All domain back-relations live on
+// the respective profile model, not on User.
+
+model User {
+  id               String    @id @default(uuid())
+  phoneNumber      String    @unique
+  email            String?   @unique
+  passwordHash     String
+  role             UserRole
+  isActive         Boolean   @default(true)
+  isPhoneVerified  Boolean   @default(false)
+  isEmailVerified  Boolean   @default(false)
+  kycStatus        KycStatus @default(PENDING)
+  kycApprovedAt    DateTime?
+  kycRejectedAt    DateTime?
+  kycRejectionNote String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  // ── Identity sub-records ──────────────────────────────────────────────────
+  profile         UserProfile?
+  kycDocuments    KycDocument[]
+  otps            Otp[]
+  refreshTokens   RefreshToken[]
+
+  // ── Domain profiles (one per role) ───────────────────────────────────────
+  warehouseProfile     WarehouseProfile?
+  testingAgencyProfile TestingAgencyProfile?
+  transportProfile     TransportProfile?
+
+  // ── Marketplace relations (User as seller / buyer / depositor) ────────────
+  productsAsSeller  Product[]        @relation("SellerProducts")
+  offersAsBuyer     Offer[]          @relation("BuyerOffers")
+  ordersAsSeller    Order[]          @relation("SellerOrders")
+  ordersAsBuyer     Order[]          @relation("BuyerOrders")
+
+  // ── Storage relations (User as depositor / owner) ─────────────────────────
+  storageBookings   StorageBooking[]
+  warehouseReceipts WarehouseReceipt[]
+
+  // ── Testing / transport as requester ─────────────────────────────────────
+  testingRequests   TestingRequest[]  @relation("TestingRequester")
+  transportRequests TransportRequest[] @relation("TransportRequester")
+
+  // ── Messaging & social ───────────────────────────────────────────────────
+  messagesSent      Message[]         @relation("MessageSender")
+  messagesReceived  Message[]         @relation("MessageReceiver")
+  ratingsGiven      Rating[]          @relation("RatingReviewer")
+  ratingsReceived   Rating[]          @relation("RatingReviewed")
+  notifications     Notification[]
+  transactions      Transaction[]
+
+  @@index([phoneNumber])
+  @@index([email])
+  @@index([role])
+  @@map("users")
+}
+
+model UserProfile {
+  id              String    @id @default(uuid())
+  userId          String    @unique
+  fullName        String
+  cnicNumber      String?   @unique
+  dateOfBirth     DateTime?
+  address         String?
+  city            String?
+  province        String?
+  country         String    @default("Pakistan")
+  profilePhotoUrl String?
+  // Business
+  businessName    String?
+  ntnNumber       String?
+  companyAddress  String?
+  licenseNumber   String?
+  // Farm (farmers)
+  farmSizeAcres   Float?
+  farmLocation    String?
+  farmGps         String?
+  cropsGrown      String[]
+  // Bank
+  bankName        String?
+  bankAccountNo   String?
+  iban            String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_profiles")
+}
+
+model KycDocument {
+  id          String    @id @default(uuid())
+  userId      String
+  docType     String    // cnic_front | cnic_back | selfie | business_license | ntn
+  fileUrl     String
+  s3Key       String?
+  ocrData     Json?
+  status      String    @default("pending")
+  reviewNote  String?
+  reviewedBy  String?
+  reviewedAt  DateTime?
+  createdAt   DateTime  @default(now())
+
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("kyc_documents")
+}
+
+model Otp {
+  id        String   @id @default(uuid())
+  userId    String
+  code      String
+  purpose   String   // phone_verify | login | password_reset
+  expiresAt DateTime
+  isUsed    Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("otps")
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  isRevoked Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+// ─── PRODUCTS ─────────────────────────────────────────────────────────────────
+
+model Product {
+  id               String          @id @default(uuid())
+  sellerId         String
+  category         ProductCategory
+  name             String
+  description      String?
+  quantity         Float
+  unit             String
+  askingPrice      Decimal         @db.Decimal(14, 2)
+  currency         String          @default("PKR")
+  minOrderQty      Float
+  locationCity     String
+  locationProvince String
+  locationGps      String?
+  harvestDate      DateTime?
+  packagingType    String?
+  deliveryTerms    String?
+  status           ProductStatus   @default(DRAFT)
+  viewCount        Int             @default(0)
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  seller           User            @relation("SellerProducts", fields: [sellerId], references: [id])
+  riceDetails      RiceProductDetail?
+  media            ProductMedia[]
+  certDocuments    ProductDocument[]
+  offers           Offer[]
+  savedBy          SavedProduct[]
+  ratings          Rating[]
+
+  @@index([sellerId])
+  @@index([category])
+  @@index([status])
+  @@index([locationProvince])
+  @@map("products")
+}
+
+model RiceProductDetail {
+  id               String    @id @default(uuid())
+  productId        String    @unique
+  stage            RiceStage
+  variety          String
+  newCrop          Boolean   @default(true)
+  moisturePct      Float?
+  grainLengthMm    Float?
+  grainWidthMm     Float?
+  lWRatio          Float?
+  brokenPct        Float?
+  chalkinessPct    Float?
+  purityPct        Float?
+  foreignMatterPct Float?
+  damagedGrainPct  Float?
+  yellowGrainPct   Float?
+  millingYieldPct  Float?
+  whitenessIndex   Float?
+  color            String?
+
+  product          Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@map("rice_product_details")
+}
+
+model ProductMedia {
+  id        String   @id @default(uuid())
+  productId String
+  type      String   // image | video | document
+  url       String
+  s3Key     String?
+  label     String?
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId])
+  @@map("product_media")
+}
+
+model ProductDocument {
+  id          String    @id @default(uuid())
+  productId   String
+  docType     String    // lab_report | certificate | inspection | government | export
+  title       String
+  fileUrl     String
+  s3Key       String?
+  issuedBy    String?
+  issuedDate  DateTime?
+  expiryDate  DateTime?
+  createdAt   DateTime  @default(now())
+
+  product     Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId])
+  @@map("product_documents")
+}
+
+model SavedProduct {
+  id        String   @id @default(uuid())
+  userId    String
+  productId String
+  createdAt DateTime @default(now())
+
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, productId])
+  @@map("saved_products")
+}
+
+// ─── OFFERS & ORDERS ──────────────────────────────────────────────────────────
+
+model Offer {
+  id             String      @id @default(uuid())
+  productId      String
+  buyerId        String
+  offeredPrice   Decimal     @db.Decimal(14, 2)
+  quantity       Float
+  message        String?
+  status         OfferStatus @default(PENDING)
+  counterPrice   Decimal?    @db.Decimal(14, 2)
+  counterMessage String?
+  expiresAt      DateTime?
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  product        Product     @relation(fields: [productId], references: [id])
+  buyer          User        @relation("BuyerOffers", fields: [buyerId], references: [id])
+  order          Order?
+
+  @@index([productId])
+  @@index([buyerId])
+  @@index([status])
+  @@map("offers")
+}
+
+model Order {
+  id              String        @id @default(uuid())
+  offerId         String        @unique
+  sellerId        String
+  buyerId         String
+  totalAmount     Decimal       @db.Decimal(16, 2)
+  platformFeePct  Decimal       @db.Decimal(5, 2)  @default(1.5)
+  platformFee     Decimal       @db.Decimal(14, 2)
+  netSellerAmount Decimal       @db.Decimal(14, 2)
+  status          OrderStatus   @default(PENDING)
+  paymentStatus   PaymentStatus @default(UNPAID)
+  contractUrl     String?
+  deliveryAddress String?
+  notes           String?
+  completedAt     DateTime?
+  cancelledAt     DateTime?
+  cancelReason    String?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  offer              Offer               @relation(fields: [offerId], references: [id])
+  seller             User                @relation("SellerOrders", fields: [sellerId], references: [id])
+  buyer              User                @relation("BuyerOrders", fields: [buyerId], references: [id])
+  payments           Payment[]
+  transportRequest   TransportRequest?
+  testingRequests    TestingRequest[]
+  statusHistory      OrderStatusHistory[]
+  ratings            Rating[]
+  // NOTE: transactions are linked via plain referenceId string — no FK here
+  // because Transaction.referenceId is polymorphic (orders, bookings, etc.)
+
+  @@index([sellerId])
+  @@index([buyerId])
+  @@index([status])
+  @@map("orders")
+}
+
+model OrderStatusHistory {
+  id        String      @id @default(uuid())
+  orderId   String
+  status    OrderStatus
+  note      String?
+  changedBy String?
+  createdAt DateTime    @default(now())
+
+  order     Order       @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@map("order_status_history")
+}
+
+model Payment {
+  id              String   @id @default(uuid())
+  orderId         String
+  amount          Decimal  @db.Decimal(14, 2)
+  currency        String   @default("PKR")
+  method          String   // easypaisa | jazzcash | bank_transfer | stripe | cash
+  status          String   @default("pending")
+  gatewayRef      String?
+  gatewayResponse Json?
+  paidAt          DateTime?
+  createdAt       DateTime @default(now())
+
+  order           Order    @relation(fields: [orderId], references: [id])
+
+  @@index([orderId])
+  @@map("payments")
+}
+
+// ─── WAREHOUSE ────────────────────────────────────────────────────────────────
+
+model WarehouseProfile {
+  id                  String        @id @default(uuid())
+  userId              String        @unique
+  name                String
+  type                WarehouseType
+  city                String
+  province            String
+  address             String
+  gpsCoordinates      String?
+  totalCapacityTons   Float
+  pricePerTonMonth    Decimal       @db.Decimal(10, 2)
+  minDurationDays     Int
+  commoditiesAccepted String[]
+  certifications      String[]
+  features            String[]
+  bankPartners        String[]
+  insuranceAvailable  Boolean       @default(false)
+  isActive            Boolean       @default(true)
+  isVerified          Boolean       @default(false)
+  managerName         String?
+  managerPhone        String?
+  establishedYear     Int?
+  description         String?
+  rating              Float         @default(0)
+  reviewCount         Int           @default(0)
+  createdAt           DateTime      @default(now())
+  updatedAt           DateTime      @updatedAt
+
+  // Relation back to User (profile owner)
+  user                User          @relation(fields: [userId], references: [id])
+
+  // All bookings and receipts at this warehouse
+  bookings            StorageBooking[]
+  receipts            WarehouseReceipt[]
+
+  @@index([province])
+  @@index([type])
+  @@map("warehouse_profiles")
+}
+
+model StorageBooking {
+  id               String   @id @default(uuid())
+  warehouseId      String   // FK → WarehouseProfile.id
+  depositorId      String   // FK → User.id (the person storing goods)
+  commodity        String
+  variety          String?
+  quantityTons     Float
+  packagingType    String?
+  entryDate        DateTime
+  durationDays     Int
+  exitDate         DateTime
+  pricePerTon      Decimal  @db.Decimal(10, 2)
+  totalCost        Decimal  @db.Decimal(14, 2)
+  status           String   @default("confirmed")
+  includeInsurance Boolean  @default(false)
+  notes            String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  warehouse        WarehouseProfile @relation(fields: [warehouseId], references: [id])
+  depositor        User             @relation(fields: [depositorId], references: [id])
+  receipt          WarehouseReceipt?
+
+  @@index([warehouseId])
+  @@index([depositorId])
+  @@map("storage_bookings")
+}
+
+model WarehouseReceipt {
+  id             String        @id @default(uuid())
+  receiptNumber  String        @unique
+  bookingId      String        @unique  // FK → StorageBooking.id
+  warehouseId    String        // FK → WarehouseProfile.id
+  ownerId        String        // FK → User.id
+  commodity      String
+  variety        String?
+  quantityTons   Float
+  qualityMetrics Json?
+  entryDate      DateTime
+  expiryDate     DateTime
+  marketValue    Decimal       @db.Decimal(16, 2)
+  status         ReceiptStatus @default(ACTIVE)
+  pdfUrl         String?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  booking        StorageBooking   @relation(fields: [bookingId], references: [id])
+  warehouse      WarehouseProfile @relation(fields: [warehouseId], references: [id])
+  owner          User             @relation(fields: [ownerId], references: [id])
+  lien           BankLien?
+  insurance      StorageInsurance?
+
+  @@index([ownerId])
+  @@index([status])
+  @@map("warehouse_receipts")
+}
+
+model BankLien {
+  id           String     @id @default(uuid())
+  receiptId    String     @unique
+  bankName     String
+  loanPurpose  String
+  loanAmount   Decimal    @db.Decimal(16, 2)
+  interestRate Decimal    @db.Decimal(5, 2)
+  tenureMonths Int
+  loanOfficer  String?
+  loanRefNo    String?
+  status       LienStatus @default(ACTIVE)
+  placedAt     DateTime   @default(now())
+  releasedAt   DateTime?
+  releaseNote  String?
+  updatedAt    DateTime   @updatedAt
+
+  receipt      WarehouseReceipt @relation(fields: [receiptId], references: [id])
+
+  @@map("bank_liens")
+}
+
+model StorageInsurance {
+  id             String   @id @default(uuid())
+  receiptId      String   @unique
+  provider       String
+  planName       String
+  policyNumber   String
+  coverageAmount Decimal  @db.Decimal(16, 2)
+  premiumAmount  Decimal  @db.Decimal(12, 2)
+  coverage       String
+  startDate      DateTime
+  endDate        DateTime
+  status         String   @default("active")
+  policyDocUrl   String?
+  createdAt      DateTime @default(now())
+
+  receipt        WarehouseReceipt @relation(fields: [receiptId], references: [id])
+
+  @@map("storage_insurance")
+}
+
+// ─── TESTING ──────────────────────────────────────────────────────────────────
+// agencyId → TestingAgencyProfile.userId (NOT User.id directly)
+
+model TestingAgencyProfile {
+  id              String   @id @default(uuid())
+  userId          String   @unique  // FK → User.id
+  name            String
+  city            String
+  province        String
+  accreditations  String[]
+  services        String[]
+  basePrice       Decimal  @db.Decimal(10, 2)
+  turnaroundHours Int
+  coverageAreas   String[]
+  isActive        Boolean  @default(true)
+  isVerified      Boolean  @default(false)
+  rating          Float    @default(0)
+  reviewCount     Int      @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  user            User             @relation(fields: [userId], references: [id])
+  // All testing requests assigned to this agency
+  requests        TestingRequest[]
+
+  @@map("testing_agency_profiles")
+}
+
+model TestingRequest {
+  id                 String        @id @default(uuid())
+  requesterId        String        // FK → User.id (who requested the test)
+  agencyId           String        // FK → TestingAgencyProfile.userId
+  productId          String?
+  orderId            String?
+  servicesRequested  String[]
+  scheduledDate      DateTime?
+  fee                Decimal       @db.Decimal(10, 2)
+  paymentStatus      PaymentStatus @default(UNPAID)
+  status             TestingStatus @default(REQUESTED)
+  sampleLocation     String?
+  reportUrl          String?
+  reportData         Json?
+  completedAt        DateTime?
+  notes              String?
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+
+  // FIX 1: requester is a plain User; agency is a TestingAgencyProfile
+  requester          User                 @relation("TestingRequester", fields: [requesterId], references: [id])
+  agency             TestingAgencyProfile @relation(fields: [agencyId], references: [userId])
+  order              Order?               @relation(fields: [orderId], references: [id])
+
+  @@index([requesterId])
+  @@index([agencyId])
+  @@index([status])
+  @@map("testing_requests")
+}
+
+// ─── TRANSPORT ────────────────────────────────────────────────────────────────
+// providerId → TransportProfile.userId (NOT User.id directly)
+
+model TransportProfile {
+  id                String       @id @default(uuid())
+  userId            String       @unique  // FK → User.id
+  companyName       String
+  vehicleTypes      VehicleType[]
+  maxCapacityTons   Float
+  coverageProvinces String[]
+  pricePerKm        Decimal      @db.Decimal(8, 2)
+  hasGps            Boolean      @default(false)
+  hasInsurance      Boolean      @default(false)
+  licenseNumber     String?
+  isActive          Boolean      @default(true)
+  isVerified        Boolean      @default(false)
+  rating            Float        @default(0)
+  reviewCount       Int          @default(0)
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  user              User             @relation(fields: [userId], references: [id])
+  // All transport requests assigned to this provider
+  requests          TransportRequest[]
+
+  @@map("transport_profiles")
+}
+
+model TransportRequest {
+  id               String          @id @default(uuid())
+  requesterId      String          // FK → User.id (who requested transport)
+  providerId       String?         // FK → TransportProfile.userId
+  orderId          String?         @unique
+  pickupLocation   String
+  pickupCity       String
+  pickupGps        String?
+  deliveryLocation String
+  deliveryCity     String
+  deliveryGps      String?
+  cargoDescription String?
+  cargoWeightTons  Float?
+  vehicleType      VehicleType?
+  requiredDate     DateTime?
+  quotedPrice      Decimal?        @db.Decimal(12, 2)
+  agreedPrice      Decimal?        @db.Decimal(12, 2)
+  status           TransportStatus @default(REQUESTED)
+  trackingUrl      String?
+  currentLocation  String?
+  estimatedArrival DateTime?
+  pickedUpAt       DateTime?
+  deliveredAt      DateTime?
+  driverName       String?
+  driverPhone      String?
+  notes            String?
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  // FIX 2: requester is a plain User; provider is a TransportProfile
+  requester        User             @relation("TransportRequester", fields: [requesterId], references: [id])
+  provider         TransportProfile? @relation(fields: [providerId], references: [userId])
+  order            Order?           @relation(fields: [orderId], references: [id])
+
+  @@index([requesterId])
+  @@index([providerId])
+  @@index([status])
+  @@map("transport_requests")
+}
+
+// ─── MESSAGING ────────────────────────────────────────────────────────────────
+
+model Conversation {
+  id            String    @id @default(uuid())
+  participants  String[]  // array of User.id strings (no FK — flexible grouping)
+  lastMessage   String?
+  lastMessageAt DateTime?
+  createdAt     DateTime  @default(now())
+
+  messages      Message[]
+
+  @@map("conversations")
+}
+
+model Message {
+  id             String   @id @default(uuid())
+  conversationId String
+  senderId       String
+  receiverId     String
+  content        String
+  fileUrl        String?
+  fileType       String?
+  isRead         Boolean  @default(false)
+  readAt         DateTime?
+  createdAt      DateTime @default(now())
+
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sender         User         @relation("MessageSender",   fields: [senderId],   references: [id])
+  receiver       User         @relation("MessageReceiver", fields: [receiverId], references: [id])
+
+  @@index([conversationId])
+  @@index([senderId])
+  @@index([receiverId])
+  @@map("messages")
+}
+
+// ─── RATINGS ──────────────────────────────────────────────────────────────────
+
+model Rating {
+  id         String   @id @default(uuid())
+  reviewerId String
+  reviewedId String
+  orderId    String?
+  productId  String?
+  rating     Int      // 1–5
+  category   String   // product_quality | delivery | communication | reliability
+  comment    String?
+  createdAt  DateTime @default(now())
+
+  reviewer   User     @relation("RatingReviewer", fields: [reviewerId], references: [id])
+  reviewed   User     @relation("RatingReviewed", fields: [reviewedId], references: [id])
+  order      Order?   @relation(fields: [orderId],   references: [id])
+  product    Product? @relation(fields: [productId], references: [id])
+
+  @@index([reviewedId])
+  @@map("ratings")
+}
+
+// ─── NOTIFICATIONS ────────────────────────────────────────────────────────────
+
+model Notification {
+  id        String           @id @default(uuid())
+  userId    String
+  type      NotificationType
+  title     String
+  body      String
+  data      Json?
+  isRead    Boolean          @default(false)
+  readAt    DateTime?
+  createdAt DateTime         @default(now())
+
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([isRead])
+  @@map("notifications")
+}
+
+// ─── TRANSACTIONS ─────────────────────────────────────────────────────────────
+// referenceId is intentionally polymorphic (can point to orderId, bookingId,
+// testingRequestId, transportRequestId, etc.).
+// We do NOT add a formal Prisma FK here because Prisma does not support
+// polymorphic relations. Query by referenceId + referenceType in application code.
+
+model Transaction {
+  id            String          @id @default(uuid())
+  userId        String
+  type          TransactionType
+  amount        Decimal         @db.Decimal(14, 2)
+  currency      String          @default("PKR")
+  description   String
+  referenceId   String?         // polymorphic — orderId | bookingId | requestId | …
+  referenceType String?         // "order" | "storage" | "testing" | "transport"
+  balanceBefore Decimal?        @db.Decimal(14, 2)
+  balanceAfter  Decimal?        @db.Decimal(14, 2)
+  createdAt     DateTime        @default(now())
+
+  user          User            @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([type])
+  @@index([referenceId])
+  @@map("transactions")
+}

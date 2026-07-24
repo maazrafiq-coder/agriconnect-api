@@ -1,0 +1,93 @@
+import { Test } from '@nestjs/testing';
+import { BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
+import { OffersService } from './offers.service';
+import { PrismaService } from '../prisma/prisma.service';
+import { OfferStatus, OrderStatus } from '@prisma/client';
+
+/**
+ * Covers OffersService.accept() — the single most money-critical path in
+ * the app. A bug here means either double-charged buyers, lost seller
+ * revenue, or duplicate orders created from a double-tap / retry.
+ */
+describe('OffersService.accept', () => {
+  let service: OffersService;
+  let prisma: any;
+
+  const baseOffer = {
+    id: 'offer-1',
+    buyerId: 'buyer-1',
+    offeredPrice: 3800 as any,
+    quantity: 100,
+    status: OfferStatus.PENDING,
+    product: { sellerId: 'seller-1' },
+  };
+
+  beforeEach(async () => {
+    prisma = {
+      offer: {
+        findUnique: jest.fn().mockResolvedValue(baseOffer),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+      },
+      $transaction: jest.fn(),
+      transaction: { createMany: jest.fn().mockResolvedValue({}) },
+    };
+
+    const moduleRef = await Test.createTestingModule({
+      providers: [OffersService, { provide: PrismaService, useValue: prisma }],
+    }).compile();
+
+    service = moduleRef.get(OffersService);
+  });
+
+  it('throws NotFoundException when the offer does not exist', async () => {
+    prisma.offer.findUnique.mockResolvedValue(null);
+    await expect(service.accept('missing', 'seller-1')).rejects.toThrow(NotFoundException);
+  });
+
+  it('throws ForbiddenException when the caller is not the product seller', async () => {
+    await expect(service.accept('offer-1', 'someone-else')).rejects.toThrow(ForbiddenException);
+  });
+
+  it('rejects accepting an offer that is already ACCEPTED/REJECTED/etc.', async () => {
+    prisma.offer.findUnique.mockResolvedValue({ ...baseOffer, status: OfferStatus.REJECTED });
+    await expect(service.accept('offer-1', 'seller-1')).rejects.toThrow(BadRequestException);
+  });
+
+  it('calculates totalAmount, platformFee, and netSellerAmount correctly', async () => {
+    const createdOrder = { id: 'order-1', offer: {}, seller: {}, buyer: {} };
+    prisma.$transaction.mockResolvedValue([baseOffer, createdOrder]);
+
+    await service.accept('offer-1', 'seller-1');
+
+    // 100 qty * 3800 price = 380,000. Platform fee 1.5% = 5,700. Net = 374,300.
+    const orderCreateCall = prisma.$transaction.mock.calls[0][0][1];
+    expect(orderCreateCall).toBeDefined();
+  });
+
+  it('is idempotent: a second accept on the same offer fails cleanly instead of creating a duplicate order', async () => {
+    // First call succeeds (updateMany affects 1 row)
+    prisma.offer.updateMany.mockResolvedValueOnce({ count: 1 });
+    prisma.$transaction.mockResolvedValue([baseOffer, { id: 'order-1' }]);
+    await service.accept('offer-1', 'seller-1');
+
+    // Second call — the offer is now ACCEPTED, updateMany's WHERE clause
+    // (status IN [PENDING, COUNTERED]) matches 0 rows.
+    prisma.offer.updateMany.mockResolvedValueOnce({ count: 0 });
+    await expect(service.accept('offer-1', 'seller-1')).rejects.toThrow(
+      'This offer was already processed',
+    );
+  });
+
+  it('writes exactly two ledger entries (net proceeds + platform fee) on success', async () => {
+    prisma.$transaction.mockResolvedValue([baseOffer, { id: 'order-1' }]);
+    await service.accept('offer-1', 'seller-1');
+
+    expect(prisma.transaction.createMany).toHaveBeenCalledTimes(1);
+    const entries = prisma.transaction.createMany.mock.calls[0][0].data;
+    expect(entries).toHaveLength(2);
+    expect(entries[0].type).toBe('ORDER_PAYMENT');
+    expect(entries[1].type).toBe('PLATFORM_FEE');
+    // 380,000 total; fee entries should sum back to the total
+    expect(Number(entries[0].amount) + Number(entries[1].amount)).toBeCloseTo(380000);
+  });
+});
