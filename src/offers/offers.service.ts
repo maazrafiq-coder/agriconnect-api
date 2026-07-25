@@ -230,10 +230,10 @@ export class OrdersService {
         payments: true,
         statusHistory: { orderBy: { createdAt: 'asc' } },
         testingRequests: {
-          include: { agency: { select: { profile: { select: { fullName: true } }, testingAgencyProfile: true } } },
+          include: { agency: { select: { name: true, city: true, user: { select: { profile: { select: { fullName: true } } } } } } },
         },
         transportRequest: {
-          include: { provider: { select: { profile: { select: { fullName: true } }, transportProfile: true } } },
+          include: { provider: { select: { companyName: true, user: { select: { profile: { select: { fullName: true } } } } } } },
         },
         ratings: true,
       },

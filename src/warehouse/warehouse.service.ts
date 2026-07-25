@@ -244,7 +244,7 @@ export class WarehouseService {
   ) {
     const booking = await this.prisma.storageBooking.findUnique({
       where: { id: bookingId },
-      include: { warehouse: true },
+      include: { warehouse: true, receipt: true },
     });
     if (!booking) throw new NotFoundException('Booking not found');
     if (booking.warehouse.userId !== operatorId) throw new ForbiddenException('Not your warehouse');
