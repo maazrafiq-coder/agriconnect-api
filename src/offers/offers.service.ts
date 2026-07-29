@@ -137,7 +137,7 @@ export class OffersService {
     return { offer: updatedOffer, order };
   }
 
-  async reject(offerId: string, sellerId: string) {
+  async reject(offerId: string, sellerId: string, reason?: string) {
     const offer = await this.prisma.offer.findUnique({
       where: { id: offerId },
       include: { product: true },
@@ -147,7 +147,7 @@ export class OffersService {
 
     return this.prisma.offer.update({
       where: { id: offerId },
-      data: { status: OfferStatus.REJECTED },
+      data: { status: OfferStatus.REJECTED, rejectionReason: reason || undefined },
     });
   }
 

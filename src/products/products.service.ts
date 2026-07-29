@@ -1,5 +1,5 @@
 import {
-  Injectable, NotFoundException, ForbiddenException,
+  Injectable, NotFoundException, ForbiddenException, BadRequestException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateProductDto, UpdateProductDto, ProductQueryDto } from './dto/product.dto';
@@ -12,6 +12,28 @@ export class ProductsService {
   // ─── CREATE ───────────────────────────────────────────────────────────────
   async create(sellerId: string, dto: CreateProductDto) {
     const { riceDetails, ...productData } = dto;
+
+    // Category is now admin-managed data, not a hardcoded enum — validate
+    // the slug is real and active so listings can't reference a category
+    // an admin removed or that never existed.
+    const category = await this.prisma.category.findUnique({ where: { slug: productData.category } });
+    if (!category || !category.isActive) {
+      throw new BadRequestException(`"${productData.category}" is not a valid or active category`);
+    }
+
+    // Units are scoped per-category (e.g. "Bales" only valid for Cotton) or
+    // global (e.g. "kg" valid everywhere). Confirm the chosen unit is
+    // actually offered for this category before accepting the listing.
+    const validUnit = await this.prisma.unit.findFirst({
+      where: {
+        name: productData.unit,
+        isActive: true,
+        OR: [{ categoryId: null }, { categoryId: category.id }],
+      },
+    });
+    if (!validUnit) {
+      throw new BadRequestException(`"${productData.unit}" is not a valid unit for the "${category.name}" category`);
+    }
 
     const product = await this.prisma.product.create({
       data: {

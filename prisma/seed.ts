@@ -1,11 +1,85 @@
 // prisma/seed.ts
-import { PrismaClient, UserRole, KycStatus, ProductCategory, RiceStage, ProductStatus, WarehouseType } from '@prisma/client';
+import { PrismaClient, UserRole, KycStatus, RiceStage, ProductStatus, WarehouseType } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 
 const prisma = new PrismaClient();
 
 async function main() {
   console.log('🌱 Seeding AgriConnect database...');
+
+  // ─── CATEGORIES ───────────────────────────────────────────────────────────
+  // These used to be a hardcoded Prisma enum. Now they're real rows the
+  // admin can add to, rename, or deactivate from the Admin Portal without
+  // a code deploy. Seeding the same starting set so existing behavior
+  // doesn't change on first run.
+  const initialCategories = [
+    { name: 'Rice',           slug: 'rice',           icon: '🌾', sortOrder: 1 },
+    { name: 'Paddy',          slug: 'paddy',           icon: '🌾', sortOrder: 2 },
+    { name: 'Wheat',          slug: 'wheat',           icon: '🌿', sortOrder: 3 },
+    { name: 'Maize',          slug: 'maize',           icon: '🌽', sortOrder: 4 },
+    { name: 'Cotton',         slug: 'cotton',          icon: '☁️', sortOrder: 5 },
+    { name: 'Sugarcane',      slug: 'sugarcane',       icon: '🎋', sortOrder: 6 },
+    { name: 'Pulses',         slug: 'pulses',          icon: '🫘', sortOrder: 7 },
+    { name: 'Oil Seeds',      slug: 'oil-seeds',       icon: '🛢️', sortOrder: 8 },
+    { name: 'Fruits',         slug: 'fruits',          icon: '🍎', sortOrder: 9 },
+    { name: 'Vegetables',     slug: 'vegetables',      icon: '🥬', sortOrder: 10 },
+    { name: 'Livestock Feed', slug: 'livestock-feed',  icon: '🐄', sortOrder: 11 },
+    { name: 'Other',          slug: 'other',           icon: '📦', sortOrder: 12 },
+  ];
+
+  for (const cat of initialCategories) {
+    await prisma.category.upsert({
+      where: { slug: cat.slug },
+      update: {},
+      create: cat,
+    });
+  }
+  console.log(`  ✓ Seeded ${initialCategories.length} categories`);
+
+  // ─── CITIES ───────────────────────────────────────────────────────────────
+  const initialCities = [
+    { name: 'Lahore', province: 'Punjab' }, { name: 'Sheikhupura', province: 'Punjab' },
+    { name: 'Gujranwala', province: 'Punjab' }, { name: 'Multan', province: 'Punjab' },
+    { name: 'Faisalabad', province: 'Punjab' }, { name: 'Rawalpindi', province: 'Punjab' },
+    { name: 'Karachi', province: 'Sindh' }, { name: 'Hyderabad', province: 'Sindh' },
+    { name: 'Larkana', province: 'Sindh' }, { name: 'Sukkur', province: 'Sindh' },
+    { name: 'Peshawar', province: 'KPK' }, { name: 'Mardan', province: 'KPK' },
+    { name: 'Quetta', province: 'Balochistan' },
+  ];
+  for (const [i, city] of initialCities.entries()) {
+    await prisma.city.upsert({
+      where: { name_province: { name: city.name, province: city.province } },
+      update: {},
+      create: { ...city, sortOrder: i },
+    });
+  }
+  console.log(`  ✓ Seeded ${initialCities.length} cities`);
+
+  // ─── UNITS ────────────────────────────────────────────────────────────────
+  // Global units (categoryId: null) apply everywhere. Category-scoped units
+  // only show up in that category's dropdown — this is what lets Rice offer
+  // "40kg bags" while Cotton offers "Bales" without cluttering either list.
+  const riceCategory = await prisma.category.findUnique({ where: { slug: 'rice' } });
+  const cottonCategory = await prisma.category.findUnique({ where: { slug: 'cotton' } });
+
+  const initialUnits = [
+    { name: 'kg', categoryId: null, sortOrder: 1 },
+    { name: 'Tons', categoryId: null, sortOrder: 2 },
+    { name: 'Maunds', categoryId: null, sortOrder: 3 },
+    { name: '40kg bags', categoryId: riceCategory?.id, sortOrder: 4 },
+    { name: '50kg bags', categoryId: riceCategory?.id, sortOrder: 5 },
+    { name: 'Bales', categoryId: cottonCategory?.id, sortOrder: 6 },
+  ];
+  for (const unit of initialUnits) {
+    const existing = await prisma.unit.findFirst({
+      where: { name: unit.name, categoryId: unit.categoryId ?? null },
+    });
+    if (!existing) {
+      await prisma.unit.create({ data: unit });
+    }
+  }
+  console.log(`  ✓ Seeded ${initialUnits.length} units`);
+
 
   // ─── ADMIN ────────────────────────────────────────────────────────────────
   const adminHash = await bcrypt.hash('Admin@123', 10);
@@ -135,7 +209,7 @@ async function main() {
     create: {
       id: 'seed-product-001',
       sellerId: seller.id,
-      category: ProductCategory.RICE,
+      category: 'rice',
       name: '1121 Basmati — Milled White',
       description: 'Premium 1121 Basmati from certified fields. Extra long grain, excellent aroma, export-grade quality preferred by Middle East markets.',
       quantity: 500,
@@ -174,7 +248,7 @@ async function main() {
     create: {
       id: 'seed-product-002',
       sellerId: seller.id,
-      category: ProductCategory.RICE,
+      category: 'rice',
       name: 'Super Basmati — Export Grade',
       description: 'Super Basmati with superior aroma and extra long grain. RRI Kala Shah Kaku certified.',
       quantity: 300,

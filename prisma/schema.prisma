@@ -34,19 +34,59 @@ enum KycStatus {
   REJECTED
 }
 
-enum ProductCategory {
-  RICE
-  PADDY
-  WHEAT
-  MAIZE
-  COTTON
-  SUGARCANE
-  PULSES
-  OIL_SEEDS
-  FRUITS
-  VEGETABLES
-  LIVESTOCK_FEED
-  OTHER
+// NOTE: ProductCategory used to be a hardcoded enum here. It's now the
+// Category model below — a real table the admin can add/edit/deactivate
+// from the Admin Portal without a code deploy. Product.category stores
+// the Category.slug as a plain string (see Product model).
+
+model Category {
+  id          String   @id @default(uuid())
+  name        String   @unique          // e.g. "Pulses"
+  slug        String   @unique          // e.g. "pulses" — what Product.category stores
+  icon        String?                    // e.g. "🫘" — shown in filters/dropdowns
+  description String?
+  isActive    Boolean  @default(true)   // soft "remove" — hides from filters/create-listing
+                                          // without breaking existing products that reference it
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  units       Unit[]
+
+  @@map("categories")
+}
+
+model City {
+  id        String   @id @default(uuid())
+  name      String                        // e.g. "Sheikhupura"
+  province  String                        // e.g. "Punjab" — free text, matches the province
+                                            // dropdown already used by Product.locationProvince
+  isActive  Boolean  @default(true)
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([name, province])              // "Multan, Punjab" is distinct from a hypothetical
+                                            // "Multan" in another province — same name shouldn't
+                                            // collide across provinces
+  @@map("cities")
+}
+
+model Unit {
+  id         String    @id @default(uuid())
+  name       String                        // e.g. "40kg bags", "Maunds", "Bales"
+  categoryId String?                       // null = applies to ALL categories (e.g. "kg", "tons")
+                                            // set   = only offered for that specific category
+                                            // (e.g. "Bales" only makes sense for Cotton)
+  isActive   Boolean   @default(true)
+  sortOrder  Int       @default(0)
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  category   Category? @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@unique([name, categoryId])
+  @@map("units")
 }
 
 enum RiceStage {
@@ -313,7 +353,7 @@ model RefreshToken {
 model Product {
   id               String          @id @default(uuid())
   sellerId         String
-  category         ProductCategory
+  category         String          // Category.slug — see Category model
   name             String
   description      String?
   quantity         Float
@@ -430,6 +470,7 @@ model Offer {
   status         OfferStatus @default(PENDING)
   counterPrice   Decimal?    @db.Decimal(14, 2)
   counterMessage String?
+  rejectionReason String?
   expiresAt      DateTime?
   createdAt      DateTime    @default(now())
   updatedAt      DateTime    @updatedAt

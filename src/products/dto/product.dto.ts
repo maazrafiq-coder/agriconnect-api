@@ -4,7 +4,7 @@ import {
   IsDateString, IsArray, Min, ValidateNested,
 } from 'class-validator';
 import { Type } from 'class-transformer';
-import { ProductCategory, RiceStage } from '@prisma/client';
+import { RiceStage } from '@prisma/client';
 
 export class RiceDetailDto {
   @IsEnum(RiceStage)
@@ -45,8 +45,8 @@ export class RiceDetailDto {
 }
 
 export class CreateProductDto {
-  @IsEnum(ProductCategory)
-  category: ProductCategory;
+  @IsString()
+  category: string; // must match an active Category.slug — validated in ProductsService.create()
 
   @IsString()
   name: string;

@@ -32,10 +32,10 @@ export class OffersController {
     return this.offersService.accept(id, userId);
   }
 
-  // PATCH /offers/:id/reject — seller rejects
+  // PATCH /offers/:id/reject — seller rejects (optionally with a reason)
   @Patch(':id/reject')
-  reject(@Param('id') id: string, @CurrentUser('id') userId: string) {
-    return this.offersService.reject(id, userId);
+  reject(@Param('id') id: string, @CurrentUser('id') userId: string, @Body('reason') reason?: string) {
+    return this.offersService.reject(id, userId, reason);
   }
 
   // PATCH /offers/:id/counter — seller counters

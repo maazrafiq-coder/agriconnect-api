@@ -13,6 +13,8 @@ import { OffersModule } from './offers/offers.module';
 import { WarehouseModule } from './warehouse/warehouse.module';
 import { TestingModule } from './testing/testing.module';
 import { HealthModule } from './health/health.module';
+import { CategoriesModule } from './categories/categories.module';
+import { CatalogModule } from './catalog/catalog.module';
 import { AllExceptionsFilter } from './common/filters/http-exception.filter';
 import { envValidationSchema } from './config/env.validation';
 
@@ -40,6 +42,8 @@ import { envValidationSchema } from './config/env.validation';
     WarehouseModule,
     TestingModule,
     HealthModule,
+    CategoriesModule,
+    CatalogModule,
   ],
   providers: [
     // Global exception filter
