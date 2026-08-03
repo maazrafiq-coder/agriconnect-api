@@ -15,6 +15,7 @@ import { TestingModule } from './testing/testing.module';
 import { HealthModule } from './health/health.module';
 import { CategoriesModule } from './categories/categories.module';
 import { CatalogModule } from './catalog/catalog.module';
+import { MediaModule } from './media/media.module';
 import { AllExceptionsFilter } from './common/filters/http-exception.filter';
 import { envValidationSchema } from './config/env.validation';
 
@@ -44,6 +45,7 @@ import { envValidationSchema } from './config/env.validation';
     HealthModule,
     CategoriesModule,
     CatalogModule,
+    MediaModule,
   ],
   providers: [
     // Global exception filter

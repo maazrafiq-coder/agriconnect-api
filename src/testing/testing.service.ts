@@ -20,6 +20,7 @@ export class SubmitReportDto {
 }
 
 export class AgencyQueryDto {
+  @IsOptional() @IsString() search?: string;
   @IsOptional() @IsString() province?: string;
   @IsOptional() @IsString() service?: string;
   @IsOptional() @IsString() city?: string;
@@ -31,8 +32,26 @@ export class AgencyQueryDto {
 export class TestingService {
   constructor(private prisma: PrismaService) {}
 
+  // Admin: delist a testing agency without touching the underlying account
+  async adminSetActive(agencyId: string, isActive: boolean) {
+    const agency = await this.prisma.testingAgencyProfile.findUnique({ where: { id: agencyId } });
+    if (!agency) throw new NotFoundException('Testing agency not found');
+    return this.prisma.testingAgencyProfile.update({ where: { id: agencyId }, data: { isActive } });
+  }
+
+  // Admin: see ALL agencies including delisted ones (the public findAllAgencies
+  // below only ever returns isActive:true, so admins need their own view to
+  // find and relist a previously-delisted agency).
+  async adminFindAll() {
+    return this.prisma.testingAgencyProfile.findMany({
+      include: { user: { select: { profile: { select: { fullName: true } } } } },
+      orderBy: { name: 'asc' },
+    });
+  }
+
   async findAllAgencies(query: AgencyQueryDto) {
     const where: any = { isActive: true };
+    if (query.search) where.name = { contains: query.search, mode: 'insensitive' };
     if (query.province) where.province = { contains: query.province, mode: 'insensitive' };
     if (query.city) where.city = { contains: query.city, mode: 'insensitive' };
     if (query.service) where.services = { has: query.service };
@@ -154,6 +173,7 @@ export class BookTransportDto {
 }
 
 export class TransportQueryDto {
+  @IsOptional() @IsString() search?: string;
   @IsOptional() @IsString() pickupProvince?: string;
   @IsOptional() @IsString() deliveryProvince?: string;
   @IsOptional() @IsString() vehicleType?: string;
@@ -165,8 +185,23 @@ export class TransportQueryDto {
 export class TransportService {
   constructor(private prisma: PrismaService) {}
 
+  // Admin: delist a transport provider without touching the underlying account
+  async adminSetActive(providerId: string, isActive: boolean) {
+    const provider = await this.prisma.transportProfile.findUnique({ where: { id: providerId } });
+    if (!provider) throw new NotFoundException('Transport provider not found');
+    return this.prisma.transportProfile.update({ where: { id: providerId }, data: { isActive } });
+  }
+
+  async adminFindAll() {
+    return this.prisma.transportProfile.findMany({
+      include: { user: { select: { profile: { select: { fullName: true } } } } },
+      orderBy: { companyName: 'asc' },
+    });
+  }
+
   async findAllProviders(query: TransportQueryDto) {
     const where: any = { isActive: true };
+    if (query.search) where.companyName = { contains: query.search, mode: 'insensitive' };
     if (query.pickupProvince) where.coverageProvinces = { has: query.pickupProvince };
     if (query.vehicleType) where.vehicleTypes = { has: query.vehicleType };
 

@@ -97,6 +97,13 @@ export class ProductsController {
     return this.productsService.addMedia(id, userId, files, type);
   }
 
+  // PATCH /products/media/:mediaId/set-primary — set the listing's display picture
+  @Patch('media/:mediaId/set-primary')
+  @UseGuards(JwtAuthGuard)
+  setPrimaryMedia(@Param('mediaId') mediaId: string, @CurrentUser('id') userId: string) {
+    return this.productsService.setPrimaryMedia(mediaId, userId);
+  }
+
   // POST /products/:id/save — toggle save
   @Post(':id/save')
   @UseGuards(JwtAuthGuard)

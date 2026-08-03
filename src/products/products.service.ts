@@ -57,7 +57,7 @@ export class ProductsService {
 
   // ─── FIND ALL (with search & filters) ─────────────────────────────────────
   async findAll(query: ProductQueryDto) {
-    const { search, category, province, variety, stage, minPrice, maxPrice, verifiedOnly, sortBy, page = 1, limit = 20 } = query;
+    const { search, category, province, city, variety, stage, minPrice, maxPrice, verifiedOnly, sortBy, page = 1, limit = 20 } = query;
     const skip = (page - 1) * limit;
 
     const where: any = { status: ProductStatus.ACTIVE };
@@ -67,19 +67,32 @@ export class ProductsService {
         { name: { contains: search, mode: 'insensitive' } },
         { description: { contains: search, mode: 'insensitive' } },
         { locationCity: { contains: search, mode: 'insensitive' } },
+        { locationProvince: { contains: search, mode: 'insensitive' } },
+        { category: { contains: search, mode: 'insensitive' } },
         { riceDetails: { variety: { contains: search, mode: 'insensitive' } } },
+        { seller: { profile: { fullName: { contains: search, mode: 'insensitive' } } } },
+        { seller: { profile: { businessName: { contains: search, mode: 'insensitive' } } } },
       ];
     }
     if (category) where.category = category;
     if (province) where.locationProvince = { contains: province, mode: 'insensitive' };
+    if (city) where.locationCity = { contains: city, mode: 'insensitive' };
     if (minPrice || maxPrice) {
       where.askingPrice = {};
       if (minPrice) where.askingPrice.gte = minPrice;
       if (maxPrice) where.askingPrice.lte = maxPrice;
     }
-    if (variety && where.riceDetails) where.riceDetails.variety = { contains: variety, mode: 'insensitive' };
-    if (stage) where.riceDetails = { ...where.riceDetails, stage };
-    if (verifiedOnly) where.seller = { kycStatus: 'APPROVED' };
+    // NOTE: riceDetails filter object must be built in one place — building
+    // it incrementally across two separate `if` blocks meant `variety`
+    // silently did nothing unless `stage` happened to run first and create
+    // the object. Combining them here fixes that.
+    if (variety || stage) {
+      where.riceDetails = {
+        ...(variety && { variety: { contains: variety, mode: 'insensitive' } }),
+        ...(stage && { stage }),
+      };
+    }
+    if (verifiedOnly) where.seller = { ...(where.seller || {}), kycStatus: 'APPROVED' };
 
     const orderBy: any = (() => {
       switch (sortBy) {
@@ -191,6 +204,8 @@ export class ProductsService {
     if (!product) throw new NotFoundException('Product not found');
     if (product.sellerId !== sellerId) throw new ForbiddenException('Not your listing');
 
+    const existingCount = await this.prisma.productMedia.count({ where: { productId, type: 'image' } });
+
     const created = await Promise.all(
       files.map((file, index) =>
         this.prisma.productMedia.create({
@@ -199,12 +214,28 @@ export class ProductsService {
             type,
             url: `/uploads/products/${file.filename}`,
             s3Key: file.filename,
-            sortOrder: index,
+            sortOrder: existingCount + index,
+            // First image uploaded becomes the display picture automatically —
+            // shown on the marketplace card face. Seller can change it later.
+            isPrimary: type === 'image' && existingCount === 0 && index === 0,
           },
         })
       )
     );
     return created;
+  }
+
+  // Sets which image shows on the listing card face — clears any previous flag first.
+  async setPrimaryMedia(mediaId: string, sellerId: string) {
+    const media = await this.prisma.productMedia.findUnique({ where: { id: mediaId }, include: { product: true } });
+    if (!media) throw new NotFoundException('Media not found');
+    if (media.product.sellerId !== sellerId) throw new ForbiddenException('Not your listing');
+
+    await this.prisma.$transaction([
+      this.prisma.productMedia.updateMany({ where: { productId: media.productId }, data: { isPrimary: false } }),
+      this.prisma.productMedia.update({ where: { id: mediaId }, data: { isPrimary: true } }),
+    ]);
+    return { message: 'Display picture updated' };
   }
 
   // ─── SELLER LISTINGS ─────────────────────────────────────────────────────

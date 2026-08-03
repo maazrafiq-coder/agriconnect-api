@@ -515,4 +515,13 @@ export class WarehouseService {
       data: { isVerified: verified },
     });
   }
+
+  // "Delist" a warehouse — hides it from public browsing without touching
+  // the underlying user account (an admin might want to hide a listing
+  // while still letting the operator log in to fix something).
+  async adminSetActive(warehouseId: string, isActive: boolean) {
+    const warehouse = await this.prisma.warehouseProfile.findUnique({ where: { id: warehouseId } });
+    if (!warehouse) throw new NotFoundException('Warehouse not found');
+    return this.prisma.warehouseProfile.update({ where: { id: warehouseId }, data: { isActive } });
+  }
 }

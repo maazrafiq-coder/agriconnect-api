@@ -25,12 +25,16 @@ enum UserRole {
   INSURANCE
   INVESTOR
   ADMIN
+  MODERATOR  // delegated staff: can review KYC/documents and recommend
+             // approval, but only ADMIN can grant final approval
 }
 
 enum KycStatus {
-  PENDING
-  SUBMITTED
-  APPROVED
+  PENDING       // just registered, nothing submitted yet
+  SUBMITTED     // registration/docs submitted, awaiting any review
+  RECOMMENDED   // a moderator reviewed it and recommends approval —
+                // still requires ADMIN to actually approve
+  APPROVED      // can log in
   REJECTED
 }
 
@@ -214,7 +218,7 @@ enum NotificationType {
 
 model User {
   id               String    @id @default(uuid())
-  phoneNumber      String    @unique
+  phoneNumber      String?   @unique  // optional — user must provide phone OR email (enforced in service layer)
   email            String?   @unique
   passwordHash     String
   role             UserRole
@@ -419,6 +423,8 @@ model ProductMedia {
   url       String
   s3Key     String?
   label     String?
+  isPrimary Boolean  @default(false) // the one shown on the listing card face —
+                                       // exactly one per product should be true
   sortOrder Int      @default(0)
   createdAt DateTime @default(now())
 
@@ -923,4 +929,45 @@ model Transaction {
   @@index([type])
   @@index([referenceId])
   @@map("transactions")
+}
+
+// ─── LISTING MEDIA (Warehouse / Testing Agency / Transport) ───────────────────
+// Product already has its own ProductMedia model. Warehouses, testing
+// agencies, and transporters didn't have anywhere to attach photos or
+// documents — this covers all three with one polymorphic-by-convention
+// table (entityType + entityId strings, same pattern already used by
+// Transaction.referenceId above) rather than three near-identical models.
+model ListingMedia {
+  id         String   @id @default(uuid())
+  entityType String   // "warehouse" | "testing_agency" | "transport"
+  entityId   String   // WarehouseProfile.id | TestingAgencyProfile.id | TransportProfile.id
+  type       String   // "image" | "document"
+  url        String
+  s3Key      String?
+  label      String?
+  isPrimary  Boolean  @default(false) // the display picture shown on the listing card
+  sortOrder  Int      @default(0)
+  uploadedBy String?  // User.id of whoever uploaded it
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@map("listing_media")
+}
+
+// ─── AUDIT LOG ──────────────────────────────────────────────────────────────
+model AuditLog {
+  id         String   @id @default(uuid())
+  userId     String?  // who performed the action (null for system-initiated)
+  action     String   // "login" | "password_change" | "kyc_approved" | "kyc_rejected" |
+                        // "product_removed" | "user_deactivated" | "user_created_by_admin" | …
+  entityType String?  // "user" | "product" | "order" | "warehouse" | …
+  entityId   String?
+  details    Json?    // free-form context (e.g. { reason: "..." })
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+
+  @@index([userId])
+  @@index([action])
+  @@index([createdAt])
+  @@map("audit_logs")
 }

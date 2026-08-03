@@ -1,9 +1,14 @@
-import { IsString, IsEmail, IsOptional, IsEnum, MinLength, IsMobilePhone } from 'class-validator';
+import { IsString, IsEmail, IsOptional, IsEnum, MinLength } from 'class-validator';
 import { UserRole } from '@prisma/client';
 
 export class RegisterDto {
+  // Phone and email are BOTH optional at the field level — validated as
+  // "at least one required" in AuthService.register() itself, since
+  // class-validator doesn't cleanly express "one of these two" across
+  // separate optional fields.
+  @IsOptional()
   @IsString()
-  phoneNumber: string;
+  phoneNumber?: string;
 
   @IsOptional()
   @IsEmail()
@@ -21,8 +26,9 @@ export class RegisterDto {
 }
 
 export class VerifyOtpDto {
+  // Whichever identifier (phone or email) the OTP was sent to
   @IsString()
-  phoneNumber: string;
+  identifier: string;
 
   @IsString()
   otp: string;
@@ -32,8 +38,9 @@ export class VerifyOtpDto {
 }
 
 export class LoginDto {
+  // Accepts either a phone number or an email address
   @IsString()
-  phoneNumber: string;
+  identifier: string;
 
   @IsString()
   password: string;
@@ -64,12 +71,12 @@ export class SubmitKycDto {
 
 export class ForgotPasswordDto {
   @IsString()
-  phoneNumber: string;
+  identifier: string;
 }
 
 export class ResetPasswordDto {
   @IsString()
-  phoneNumber: string;
+  identifier: string;
 
   @IsString()
   otp: string;
@@ -77,4 +84,25 @@ export class ResetPasswordDto {
   @IsString()
   @MinLength(8)
   newPassword: string;
+}
+
+export class ChangePasswordDto {
+  @IsString()
+  currentPassword: string;
+
+  @IsString()
+  @MinLength(8)
+  newPassword: string;
+}
+
+export class AdminCreateUserDto {
+  @IsOptional() @IsString() phoneNumber?: string;
+  @IsOptional() @IsEmail() email?: string;
+  @IsString() fullName: string;
+  @IsEnum(UserRole) role: UserRole;
+  @IsOptional() @IsString() @MinLength(8) password?: string; // auto-generated if omitted
+}
+
+export class AdminResetPasswordDto {
+  @IsOptional() @IsString() @MinLength(8) newPassword?: string; // auto-generated if omitted
 }

@@ -119,4 +119,12 @@ export class WarehouseController {
   adminVerify(@Param('id') id: string, @Body('verified') verified: boolean) {
     return this.warehouseService.adminVerify(id, verified);
   }
+
+  // PATCH /warehouse/admin/:id/active — delist/relist without touching the account
+  @Patch('admin/:id/active')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('ADMIN')
+  adminSetActive(@Param('id') id: string, @Body('isActive') isActive: boolean) {
+    return this.warehouseService.adminSetActive(id, isActive);
+  }
 }

@@ -2,6 +2,8 @@ import { Controller, Get, Post, Patch, Param, Body, Query, UseGuards } from '@ne
 import { TestingService, CreateTestingRequestDto, SubmitReportDto, AgencyQueryDto } from './testing.service';
 import { TransportService, CreateTransportRequestDto, BookTransportDto, TransportQueryDto } from './testing.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { RolesGuard } from '../common/guards/roles.guard';
+import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { TestingStatus } from '@prisma/client';
 
@@ -49,6 +51,22 @@ export class TestingController {
   ) {
     return this.testingService.submitReport(id, userId, dto);
   }
+
+  // GET /testing/admin/all — includes delisted agencies too
+  @Get('admin/all')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('ADMIN')
+  adminFindAll() {
+    return this.testingService.adminFindAll();
+  }
+
+  // PATCH /testing/admin/:id/active — delist/relist without touching the account
+  @Patch('admin/:id/active')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('ADMIN')
+  adminSetActive(@Param('id') id: string, @Body('isActive') isActive: boolean) {
+    return this.testingService.adminSetActive(id, isActive);
+  }
 }
 
 // ─── TRANSPORT CONTROLLER ─────────────────────────────────────────────────────
@@ -95,5 +113,21 @@ export class TransportController {
   @Get('track/:id')
   track(@Param('id') id: string) {
     return this.transportService.track(id);
+  }
+
+  // GET /transport/admin/all — includes delisted providers too
+  @Get('admin/all')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('ADMIN')
+  adminFindAll() {
+    return this.transportService.adminFindAll();
+  }
+
+  // PATCH /transport/admin/:id/active — delist/relist without touching the account
+  @Patch('admin/:id/active')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('ADMIN')
+  adminSetActive(@Param('id') id: string, @Body('isActive') isActive: boolean) {
+    return this.transportService.adminSetActive(id, isActive);
   }
 }

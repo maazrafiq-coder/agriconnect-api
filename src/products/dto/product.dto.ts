@@ -118,6 +118,9 @@ export class ProductQueryDto {
   province?: string;
 
   @IsOptional() @IsString()
+  city?: string;
+
+  @IsOptional() @IsString()
   variety?: string;
 
   @IsOptional() @IsString()
