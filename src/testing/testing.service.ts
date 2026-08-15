@@ -2,7 +2,7 @@
 import { Injectable, NotFoundException, ForbiddenException, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { TestingStatus, PaymentStatus } from '@prisma/client';
-import { IsString, IsNumber, IsOptional, IsArray, IsDateString, Min } from 'class-validator';
+import { IsString, IsNumber, IsOptional, IsArray, IsDateString, IsBoolean, Min } from 'class-validator';
 
 export class CreateTestingRequestDto {
   @IsString() agencyId: string;
@@ -26,6 +26,28 @@ export class AgencyQueryDto {
   @IsOptional() @IsString() city?: string;
   @IsOptional() @IsNumber() @Min(1) page?: number = 1;
   @IsOptional() @IsNumber() @Min(1) limit?: number = 20;
+}
+
+export class RegisterAgencyDto {
+  @IsString() name: string;
+  @IsString() city: string;
+  @IsString() province: string;
+  @IsArray() @IsString({ each: true }) services: string[];
+  @IsNumber() @Min(0) basePrice: number;
+  @IsNumber() @Min(1) turnaroundHours: number;
+  @IsOptional() @IsArray() @IsString({ each: true }) accreditations?: string[];
+  @IsOptional() @IsArray() @IsString({ each: true }) coverageAreas?: string[];
+}
+
+export class UpdateAgencyDto {
+  @IsOptional() @IsString() name?: string;
+  @IsOptional() @IsString() city?: string;
+  @IsOptional() @IsString() province?: string;
+  @IsOptional() @IsArray() @IsString({ each: true }) services?: string[];
+  @IsOptional() @IsNumber() @Min(0) basePrice?: number;
+  @IsOptional() @IsNumber() @Min(1) turnaroundHours?: number;
+  @IsOptional() @IsArray() @IsString({ each: true }) accreditations?: string[];
+  @IsOptional() @IsArray() @IsString({ each: true }) coverageAreas?: string[];
 }
 
 @Injectable()
@@ -116,6 +138,47 @@ export class TestingService {
     });
   }
 
+  // ─── OPERATOR SELF-SERVICE ──────────────────────────────────────────────
+  // Mirrors the pattern warehouse operators already have (register once,
+  // manage from a dashboard) — testing agencies never had a self-registration
+  // path before, so there was no way to reach the "my agency" data below.
+  async registerAgency(userId: string, dto: RegisterAgencyDto) {
+    const existing = await this.prisma.testingAgencyProfile.findUnique({ where: { userId } });
+    if (existing) throw new BadRequestException('You already have a testing agency profile');
+
+    return this.prisma.testingAgencyProfile.create({
+      data: { userId, ...dto } as any,
+    });
+  }
+
+  async getMyAgency(userId: string) {
+    const agency = await this.prisma.testingAgencyProfile.findUnique({ where: { userId } });
+    if (!agency) throw new NotFoundException('No testing agency profile found');
+
+    const [requests, pending, completed] = await Promise.all([
+      this.prisma.testingRequest.findMany({
+        where: { agencyId: userId },
+        include: { requester: { select: { profile: { select: { fullName: true, city: true } } } } },
+        orderBy: { createdAt: 'desc' },
+        take: 10,
+      }),
+      this.prisma.testingRequest.count({ where: { agencyId: userId, status: { in: ['REQUESTED', 'ASSIGNED', 'SAMPLE_COLLECTED', 'IN_PROGRESS'] as any } } }),
+      this.prisma.testingRequest.count({ where: { agencyId: userId, status: 'COMPLETED' as any } }),
+    ]);
+
+    return {
+      agency,
+      stats: { totalRequests: requests.length, pendingRequests: pending, completedRequests: completed },
+      recentRequests: requests,
+    };
+  }
+
+  async updateMyAgency(userId: string, dto: UpdateAgencyDto) {
+    const existing = await this.prisma.testingAgencyProfile.findUnique({ where: { userId } });
+    if (!existing) throw new NotFoundException('No testing agency profile found');
+    return this.prisma.testingAgencyProfile.update({ where: { userId }, data: dto as any });
+  }
+
   async getMyRequests(userId: string, role: 'requester' | 'agency') {
     const where = role === 'requester' ? { requesterId: userId } : { agencyId: userId };
     return this.prisma.testingRequest.findMany({
@@ -179,6 +242,28 @@ export class TransportQueryDto {
   @IsOptional() @IsString() vehicleType?: string;
   @IsOptional() @IsNumber() @Min(1) page?: number = 1;
   @IsOptional() @IsNumber() @Min(1) limit?: number = 20;
+}
+
+export class RegisterProviderDto {
+  @IsString() companyName: string;
+  @IsArray() @IsString({ each: true }) vehicleTypes: string[];
+  @IsNumber() @Min(0.1) maxCapacityTons: number;
+  @IsArray() @IsString({ each: true }) coverageProvinces: string[];
+  @IsNumber() @Min(0) pricePerKm: number;
+  @IsOptional() @IsBoolean() hasGps?: boolean;
+  @IsOptional() @IsBoolean() hasInsurance?: boolean;
+  @IsOptional() @IsString() licenseNumber?: string;
+}
+
+export class UpdateProviderDto {
+  @IsOptional() @IsString() companyName?: string;
+  @IsOptional() @IsArray() @IsString({ each: true }) vehicleTypes?: string[];
+  @IsOptional() @IsNumber() @Min(0.1) maxCapacityTons?: number;
+  @IsOptional() @IsArray() @IsString({ each: true }) coverageProvinces?: string[];
+  @IsOptional() @IsNumber() @Min(0) pricePerKm?: number;
+  @IsOptional() @IsBoolean() hasGps?: boolean;
+  @IsOptional() @IsBoolean() hasInsurance?: boolean;
+  @IsOptional() @IsString() licenseNumber?: string;
 }
 
 @Injectable()
@@ -285,6 +370,44 @@ export class TransportService {
     if (data.status === 'DELIVERED') updateData.deliveredAt = new Date();
 
     return this.prisma.transportRequest.update({ where: { id: requestId }, data: updateData });
+  }
+
+  // ─── OPERATOR SELF-SERVICE ──────────────────────────────────────────────
+  async registerProvider(userId: string, dto: RegisterProviderDto) {
+    const existing = await this.prisma.transportProfile.findUnique({ where: { userId } });
+    if (existing) throw new BadRequestException('You already have a transport provider profile');
+
+    return this.prisma.transportProfile.create({
+      data: { userId, ...dto } as any,
+    });
+  }
+
+  async getMyProvider(userId: string) {
+    const provider = await this.prisma.transportProfile.findUnique({ where: { userId } });
+    if (!provider) throw new NotFoundException('No transport provider profile found');
+
+    const [requests, pending, delivered] = await Promise.all([
+      this.prisma.transportRequest.findMany({
+        where: { providerId: userId },
+        include: { requester: { select: { profile: { select: { fullName: true, city: true } } } } },
+        orderBy: { createdAt: 'desc' },
+        take: 10,
+      }),
+      this.prisma.transportRequest.count({ where: { providerId: userId, status: { in: ['BOOKED', 'PICKED_UP', 'IN_TRANSIT'] as any } } }),
+      this.prisma.transportRequest.count({ where: { providerId: userId, status: 'DELIVERED' as any } }),
+    ]);
+
+    return {
+      provider,
+      stats: { totalRequests: requests.length, pendingRequests: pending, deliveredRequests: delivered },
+      recentRequests: requests,
+    };
+  }
+
+  async updateMyProvider(userId: string, dto: UpdateProviderDto) {
+    const existing = await this.prisma.transportProfile.findUnique({ where: { userId } });
+    if (!existing) throw new NotFoundException('No transport provider profile found');
+    return this.prisma.transportProfile.update({ where: { userId }, data: dto as any });
   }
 
   async getMyRequests(userId: string, role: 'requester' | 'provider') {

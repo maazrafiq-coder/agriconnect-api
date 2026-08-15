@@ -1,6 +1,6 @@
 import { Controller, Get, Post, Patch, Param, Body, Query, UseGuards } from '@nestjs/common';
-import { TestingService, CreateTestingRequestDto, SubmitReportDto, AgencyQueryDto } from './testing.service';
-import { TransportService, CreateTransportRequestDto, BookTransportDto, TransportQueryDto } from './testing.service';
+import { TestingService, CreateTestingRequestDto, SubmitReportDto, AgencyQueryDto, RegisterAgencyDto, UpdateAgencyDto } from './testing.service';
+import { TransportService, CreateTransportRequestDto, BookTransportDto, TransportQueryDto, RegisterProviderDto, UpdateProviderDto } from './testing.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
@@ -15,6 +15,28 @@ export class TestingController {
   @Get('agencies')
   findAgencies(@Query() query: AgencyQueryDto) {
     return this.testingService.findAllAgencies(query);
+  }
+
+  // ─── OPERATOR SELF-SERVICE ───────────────────────────────────────────────
+  // POST /testing/register — testing agency operator registers their listing
+  @Post('register')
+  @UseGuards(JwtAuthGuard)
+  register(@CurrentUser('id') userId: string, @Body() dto: RegisterAgencyDto) {
+    return this.testingService.registerAgency(userId, dto);
+  }
+
+  // GET /testing/my-agency — operator's own listing + request stats
+  @Get('my-agency')
+  @UseGuards(JwtAuthGuard)
+  getMyAgency(@CurrentUser('id') userId: string) {
+    return this.testingService.getMyAgency(userId);
+  }
+
+  // PATCH /testing/my-agency — edit own listing
+  @Patch('my-agency')
+  @UseGuards(JwtAuthGuard)
+  updateMyAgency(@CurrentUser('id') userId: string, @Body() dto: UpdateAgencyDto) {
+    return this.testingService.updateMyAgency(userId, dto);
   }
 
   @Post('requests')
@@ -77,6 +99,28 @@ export class TransportController {
   @Get('providers')
   findProviders(@Query() query: TransportQueryDto) {
     return this.transportService.findAllProviders(query);
+  }
+
+  // ─── OPERATOR SELF-SERVICE ───────────────────────────────────────────────
+  // POST /transport/register — transport provider operator registers their listing
+  @Post('register')
+  @UseGuards(JwtAuthGuard)
+  register(@CurrentUser('id') userId: string, @Body() dto: RegisterProviderDto) {
+    return this.transportService.registerProvider(userId, dto);
+  }
+
+  // GET /transport/my-provider — operator's own listing + request stats
+  @Get('my-provider')
+  @UseGuards(JwtAuthGuard)
+  getMyProvider(@CurrentUser('id') userId: string) {
+    return this.transportService.getMyProvider(userId);
+  }
+
+  // PATCH /transport/my-provider — edit own listing
+  @Patch('my-provider')
+  @UseGuards(JwtAuthGuard)
+  updateMyProvider(@CurrentUser('id') userId: string, @Body() dto: UpdateProviderDto) {
+    return this.transportService.updateMyProvider(userId, dto);
   }
 
   @Post('requests')

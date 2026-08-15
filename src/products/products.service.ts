@@ -115,7 +115,7 @@ export class ProductsService {
               profile: { select: { fullName: true, city: true, profilePhotoUrl: true } },
             },
           },
-          media: { where: { type: 'image' }, take: 1, orderBy: { sortOrder: 'asc' } },
+          media: { where: { type: 'image' }, take: 1, orderBy: [{ isPrimary: 'desc' }, { sortOrder: 'asc' }] },
           _count: { select: { offers: true } },
         },
         orderBy,
@@ -244,7 +244,10 @@ export class ProductsService {
       where: { sellerId },
       include: {
         riceDetails: true,
-        media: { where: { type: 'image' }, take: 1 },
+        // Show the display picture specifically — not just "whatever image
+        // happens to sort first" — so the seller's own card matches what
+        // buyers see on the marketplace.
+        media: { where: { type: 'image' }, orderBy: [{ isPrimary: 'desc' }, { sortOrder: 'asc' }], take: 1 },
         _count: { select: { offers: true } },
       },
       orderBy: { createdAt: 'desc' },
@@ -272,7 +275,7 @@ export class ProductsService {
         product: {
           include: {
             riceDetails: true,
-            media: { where: { type: 'image' }, take: 1 },
+            media: { where: { type: 'image' }, orderBy: [{ isPrimary: 'desc' }, { sortOrder: 'asc' }], take: 1 },
             seller: { select: { profile: { select: { fullName: true } }, kycStatus: true } },
           },
         },

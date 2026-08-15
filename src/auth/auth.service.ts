@@ -57,7 +57,7 @@ export class AuthService {
       message: `Registration successful. OTP sent to your ${dto.phoneNumber ? 'phone' : 'email'}.`,
       userId: user.id,
       identifier: dto.phoneNumber || dto.email,
-      ...(this.config.get('OTP_DEV_MODE') === 'true' && { devOtp: otp }),
+      ...(this.isOtpDevMode() && { devOtp: otp }),
     };
   }
 
@@ -78,18 +78,26 @@ export class AuthService {
       throw new BadRequestException('Too many attempts. Please wait 15 minutes and request a new OTP.');
     }
 
-    const otpRecord = await this.prisma.otp.findFirst({
-      where: {
-        userId: user.id,
-        code: dto.otp,
-        purpose: dto.purpose,
-        isUsed: false,
-        expiresAt: { gt: new Date() },
-      },
-    });
-    if (!otpRecord) throw new BadRequestException('Invalid or expired OTP');
+    // Dev/test bypass: when OTP_DEV_MODE is on, '000000' always verifies
+    // regardless of what's stored or whether it expired, so testers never
+    // get blocked waiting on a real code. Only ever active outside prod.
+    const isTestBypass = this.isOtpDevMode() && dto.otp === '000000';
 
-    await this.prisma.otp.update({ where: { id: otpRecord.id }, data: { isUsed: true } });
+    if (!isTestBypass) {
+      const otpRecord = await this.prisma.otp.findFirst({
+        where: {
+          userId: user.id,
+          code: dto.otp,
+          purpose: dto.purpose,
+          isUsed: false,
+          expiresAt: { gt: new Date() },
+        },
+      });
+      if (!otpRecord) throw new BadRequestException('Invalid or expired OTP');
+
+      await this.prisma.otp.update({ where: { id: otpRecord.id }, data: { isUsed: true } });
+    }
+
     await this.prisma.otp.updateMany({
       where: { userId: user.id, purpose: dto.purpose, isUsed: false },
       data: { isUsed: true },
@@ -236,7 +244,7 @@ export class AuthService {
     const otp = await this.createOtp(user.id, 'password_reset');
     return {
       message: 'OTP sent to your registered contact',
-      ...(this.config.get('OTP_DEV_MODE') === 'true' && { devOtp: otp }),
+      ...(this.isOtpDevMode() && { devOtp: otp }),
     };
   }
 
@@ -244,18 +252,22 @@ export class AuthService {
     const user = await this.findByIdentifier(dto.identifier);
     if (!user) throw new NotFoundException('User not found');
 
-    const otpRecord = await this.prisma.otp.findFirst({
-      where: {
-        userId: user.id,
-        code: dto.otp,
-        purpose: 'password_reset',
-        isUsed: false,
-        expiresAt: { gt: new Date() },
-      },
-    });
-    if (!otpRecord) throw new BadRequestException('Invalid or expired OTP');
+    const isTestBypass = this.isOtpDevMode() && dto.otp === '000000';
 
-    await this.prisma.otp.update({ where: { id: otpRecord.id }, data: { isUsed: true } });
+    if (!isTestBypass) {
+      const otpRecord = await this.prisma.otp.findFirst({
+        where: {
+          userId: user.id,
+          code: dto.otp,
+          purpose: 'password_reset',
+          isUsed: false,
+          expiresAt: { gt: new Date() },
+        },
+      });
+      if (!otpRecord) throw new BadRequestException('Invalid or expired OTP');
+
+      await this.prisma.otp.update({ where: { id: otpRecord.id }, data: { isUsed: true } });
+    }
 
     const passwordHash = await bcrypt.hash(dto.newPassword, 10);
     await this.prisma.user.update({ where: { id: user.id }, data: { passwordHash } });
@@ -396,8 +408,16 @@ export class AuthService {
     });
   }
 
+  // Joi's schema (see env.validation.ts) coerces OTP_DEV_MODE into a real
+  // boolean, so comparing against the string 'true' always evaluated to
+  // false and dev mode never actually engaged. Accept either shape here.
+  private isOtpDevMode(): boolean {
+    const raw = this.config.get('OTP_DEV_MODE');
+    return raw === true || raw === 'true';
+  }
+
   private async createOtp(userId: string, purpose: string): Promise<string> {
-    const isDevMode = this.config.get('OTP_DEV_MODE') === 'true';
+    const isDevMode = this.isOtpDevMode();
     const code = isDevMode ? '000000' : Math.floor(100000 + Math.random() * 900000).toString();
     const expiryMinutes = parseInt(this.config.get('OTP_EXPIRY_MINUTES') || '10');
 
