@@ -138,7 +138,7 @@ async function main() {
       phoneNumber: '0300-2222222',
       email: 'buyer@agriconnect.pk',
       passwordHash: buyerHash,
-      role: UserRole.EXPORTER,
+      role: UserRole.BUYER,
       isPhoneVerified: true,
       kycStatus: KycStatus.APPROVED,
       profile: {

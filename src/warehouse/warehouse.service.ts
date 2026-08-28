@@ -2,11 +2,42 @@ import {
   Injectable, NotFoundException, BadRequestException, ForbiddenException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { ReceiptStatus, LienStatus, TransactionType } from '@prisma/client';
+import { ReceiptStatus, LienStatus, TransactionType, BookingStatus } from '@prisma/client';
 import {
   IsString, IsNumber, IsOptional, IsBoolean, IsDateString, IsArray, Min,
 } from 'class-validator';
 import { v4 as uuidv4 } from 'uuid';
+import { withBookingReference, withBookingReferences } from '../common/utils/booking-reference.util';
+
+// Booking statuses that reserve warehouse capacity — a REQUESTED booking
+// isn't confirmed yet, but the tonnage is held so two buyers can't be
+// promised the same space while the operator is deciding. Released back
+// to the pool on REJECTED/CANCELLED; consumed for real once COMPLETED
+// (goods have left, so it drops out of every "in use" query below).
+const CAPACITY_HELD_STATUSES: BookingStatus[] = [
+  BookingStatus.REQUESTED,
+  BookingStatus.ACCEPTED,
+  BookingStatus.ACTIVE,
+];
+
+// Round 2 Milestone 2: explicit allow-list of legal transitions. Anything
+// not listed here is rejected with a clear error instead of silently
+// overwriting status — this is what makes the lifecycle a real state
+// machine instead of an arbitrary string anyone could set to anything.
+const ALLOWED_TRANSITIONS: Record<BookingStatus, BookingStatus[]> = {
+  [BookingStatus.REQUESTED]: [BookingStatus.ACCEPTED, BookingStatus.REJECTED, BookingStatus.CANCELLED],
+  [BookingStatus.ACCEPTED]: [BookingStatus.ACTIVE, BookingStatus.CANCELLED],
+  [BookingStatus.REJECTED]: [],
+  [BookingStatus.ACTIVE]: [BookingStatus.COMPLETED],
+  [BookingStatus.COMPLETED]: [],
+  [BookingStatus.CANCELLED]: [],
+};
+
+function assertTransition(from: BookingStatus, to: BookingStatus) {
+  if (!ALLOWED_TRANSITIONS[from]?.includes(to)) {
+    throw new BadRequestException(`Booking cannot move from ${from} to ${to}`);
+  }
+}
 
 // ─── DTOs ─────────────────────────────────────────────────────────────────────
 export class CreateWarehouseDto {
@@ -68,6 +99,14 @@ export class BuyInsuranceDto {
   @IsString() coverage: string;
 }
 
+export class RejectBookingDto {
+  @IsString() reason: string;
+}
+
+export class CancelBookingDto {
+  @IsOptional() @IsString() reason?: string;
+}
+
 // ─── SERVICE ─────────────────────────────────────────────────────────────────
 @Injectable()
 export class WarehouseService {
@@ -109,11 +148,13 @@ export class WarehouseService {
       by: ['warehouseId'],
       where: {
         warehouseId: { in: warehouses.map((w) => w.id) },
-        status: { in: ['confirmed', 'active'] },
+        status: { in: CAPACITY_HELD_STATUSES },
       },
       _sum: { quantityTons: true },
     });
-    const usedByWarehouse = new Map(usage.map((u) => [u.warehouseId, u._sum.quantityTons || 0]));
+    const usedByWarehouse = new Map<string, number>(
+      usage.map((u) => [u.warehouseId as string, (u._sum.quantityTons as number) || 0]),
+    );
 
     return {
       data: warehouses.map((w) => ({
@@ -136,7 +177,7 @@ export class WarehouseService {
     if (!warehouse) throw new NotFoundException('Warehouse not found');
 
     const activeBookings = await this.prisma.storageBooking.aggregate({
-      where: { warehouseId: id, status: { in: ['confirmed', 'active'] } },
+      where: { warehouseId: id, status: { in: CAPACITY_HELD_STATUSES } },
       _sum: { quantityTons: true },
     });
     const usedTons = activeBookings._sum.quantityTons || 0;
@@ -174,7 +215,7 @@ export class WarehouseService {
 
     // Check available capacity
     const activeBookings = await this.prisma.storageBooking.aggregate({
-      where: { warehouseId: dto.warehouseId, status: { in: ['confirmed', 'active'] } },
+      where: { warehouseId: dto.warehouseId, status: { in: CAPACITY_HELD_STATUSES } },
       _sum: { quantityTons: true },
     });
     const usedTons = activeBookings._sum.quantityTons || 0;
@@ -205,7 +246,7 @@ export class WarehouseService {
         totalCost,
         includeInsurance: dto.includeInsurance || false,
         notes: dto.notes,
-        status: 'confirmed',
+        status: BookingStatus.REQUESTED,
       },
       include: {
         warehouse: { select: { name: true, city: true, managerPhone: true } },
@@ -217,22 +258,140 @@ export class WarehouseService {
         userId: depositorId,
         type: TransactionType.STORAGE_FEE,
         amount: totalCost,
-        description: `Storage booking at ${booking.warehouse.name} (${dto.quantityTons} tons, ${dto.durationDays} days)`,
+        description: `Storage booking request at ${booking.warehouse.name} (${dto.quantityTons} tons, ${dto.durationDays} days)`,
         referenceId: booking.id,
         referenceType: 'storage',
       },
     });
 
     return {
-      booking,
-      message: 'Storage booked successfully. A Digital Warehouse Receipt will be issued upon commodity arrival and weighing.',
+      booking: withBookingReference(booking),
+      message: 'Booking request sent to the warehouse. You\'ll be notified once they accept or decline it.',
       nextSteps: [
-        'Deliver your commodity to the warehouse by the entry date',
+        'The warehouse operator will review and accept or decline your request',
+        'Once accepted, deliver your commodity to the warehouse by the entry date',
         'Warehouse staff will weigh and quality-check on arrival',
-        'Digital Warehouse Receipt (DWR) will be issued within 24 hours',
+        'Digital Warehouse Receipt (DWR) will be issued within 24 hours of arrival',
         'You can then use the DWR to apply for bank financing',
       ],
     };
+  }
+
+  // ─── MY BOOKINGS (buyer/depositor) ────────────────────────────────────────
+  async getMyBookings(depositorId: string) {
+    const bookings = await this.prisma.storageBooking.findMany({
+      where: { depositorId },
+      include: {
+        warehouse: { select: { name: true, city: true, province: true, managerPhone: true } },
+        receipt: { select: { id: true, receiptNumber: true, status: true } },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+    return withBookingReferences(bookings);
+  }
+
+  // ─── SINGLE BOOKING (buyer, operator, or admin) ───────────────────────────
+  async getBooking(bookingId: string, userId: string, role: string) {
+    const booking = await this.prisma.storageBooking.findUnique({
+      where: { id: bookingId },
+      include: {
+        warehouse: { select: { id: true, name: true, city: true, province: true, managerPhone: true, userId: true } },
+        depositor: { select: { profile: { select: { fullName: true, city: true } } } },
+        receipt: true,
+      },
+    });
+    if (!booking) throw new NotFoundException('Booking not found');
+    const isOwner = booking.depositorId === userId;
+    const isOperator = booking.warehouse.userId === userId;
+    const isAdmin = role === 'ADMIN' || role === 'MODERATOR';
+    if (!isOwner && !isOperator && !isAdmin) throw new ForbiddenException('Access denied');
+    return withBookingReference(booking);
+  }
+
+  // ─── WAREHOUSE ACCEPTS A REQUESTED BOOKING ────────────────────────────────
+  async acceptBooking(operatorId: string, bookingId: string) {
+    const booking = await this.prisma.storageBooking.findUnique({
+      where: { id: bookingId },
+      include: { warehouse: true },
+    });
+    if (!booking) throw new NotFoundException('Booking not found');
+    if (booking.warehouse.userId !== operatorId) throw new ForbiddenException('Not your warehouse');
+    assertTransition(booking.status, BookingStatus.ACCEPTED);
+
+    const updated = await this.prisma.storageBooking.update({
+      where: { id: bookingId },
+      data: { status: BookingStatus.ACCEPTED, acceptedAt: new Date() },
+      include: { warehouse: { select: { name: true, city: true } } },
+    });
+    return withBookingReference(updated);
+  }
+
+  // ─── WAREHOUSE REJECTS A REQUESTED BOOKING ────────────────────────────────
+  async rejectBooking(operatorId: string, bookingId: string, dto: RejectBookingDto) {
+    const booking = await this.prisma.storageBooking.findUnique({
+      where: { id: bookingId },
+      include: { warehouse: true },
+    });
+    if (!booking) throw new NotFoundException('Booking not found');
+    if (booking.warehouse.userId !== operatorId) throw new ForbiddenException('Not your warehouse');
+    assertTransition(booking.status, BookingStatus.REJECTED);
+
+    const updated = await this.prisma.storageBooking.update({
+      where: { id: bookingId },
+      data: { status: BookingStatus.REJECTED, rejectedAt: new Date(), rejectionReason: dto.reason },
+      include: { warehouse: { select: { name: true, city: true } } },
+    });
+    return withBookingReference(updated);
+  }
+
+  // ─── DEPOSITOR OR OPERATOR CANCELS BEFORE GOODS ARRIVE ────────────────────
+  async cancelBooking(userId: string, role: string, bookingId: string, dto: CancelBookingDto) {
+    const booking = await this.prisma.storageBooking.findUnique({
+      where: { id: bookingId },
+      include: { warehouse: true },
+    });
+    if (!booking) throw new NotFoundException('Booking not found');
+    const isOwner = booking.depositorId === userId;
+    const isOperator = booking.warehouse.userId === userId;
+    const isAdmin = role === 'ADMIN';
+    if (!isOwner && !isOperator && !isAdmin) throw new ForbiddenException('Not your booking');
+    assertTransition(booking.status, BookingStatus.CANCELLED);
+
+    const updated = await this.prisma.storageBooking.update({
+      where: { id: bookingId },
+      data: { status: BookingStatus.CANCELLED, cancelledAt: new Date(), cancelReason: dto.reason },
+      include: { warehouse: { select: { name: true, city: true } } },
+    });
+    return withBookingReference(updated);
+  }
+
+  // ─── OPERATOR MARKS A BOOKING COMPLETE (goods released) ───────────────────
+  async completeBooking(operatorId: string, bookingId: string) {
+    const booking = await this.prisma.storageBooking.findUnique({
+      where: { id: bookingId },
+      include: { warehouse: true, receipt: { include: { lien: true } } },
+    });
+    if (!booking) throw new NotFoundException('Booking not found');
+    if (booking.warehouse.userId !== operatorId) throw new ForbiddenException('Not your warehouse');
+    assertTransition(booking.status, BookingStatus.COMPLETED);
+    if (booking.receipt?.lien && booking.receipt.lien.status === LienStatus.ACTIVE) {
+      throw new BadRequestException('This receipt still has an active bank lien — it must be released before the booking can be completed');
+    }
+
+    const [updated] = await this.prisma.$transaction([
+      this.prisma.storageBooking.update({
+        where: { id: bookingId },
+        data: { status: BookingStatus.COMPLETED, completedAt: new Date() },
+        include: { warehouse: { select: { name: true, city: true } } },
+      }),
+      ...(booking.receipt && booking.receipt.status === ReceiptStatus.ACTIVE
+        ? [this.prisma.warehouseReceipt.update({
+            where: { id: booking.receipt.id },
+            data: { status: ReceiptStatus.RELEASED },
+          })]
+        : []),
+    ]);
+    return withBookingReference(updated);
   }
 
   // ─── ISSUE RECEIPT (warehouse operator) ───────────────────────────────────
@@ -249,6 +408,11 @@ export class WarehouseService {
     if (!booking) throw new NotFoundException('Booking not found');
     if (booking.warehouse.userId !== operatorId) throw new ForbiddenException('Not your warehouse');
     if (booking.receipt) throw new BadRequestException('Receipt already issued for this booking');
+    if (booking.status !== BookingStatus.ACCEPTED) {
+      throw new BadRequestException(
+        `Booking must be Accepted before a receipt can be issued (current status: ${booking.status}). Accept the booking first.`,
+      );
+    }
 
     const receiptNumber = `WR-${new Date().getFullYear()}-${String(Math.floor(Math.random() * 9000 + 1000)).padStart(4, '0')}`;
 
@@ -277,10 +441,11 @@ export class WarehouseService {
       },
     });
 
-    // Update booking status
+    // Goods have physically arrived and been weighed/quality-checked —
+    // booking moves from ACCEPTED to ACTIVE.
     await this.prisma.storageBooking.update({
       where: { id: bookingId },
-      data: { status: 'active' },
+      data: { status: BookingStatus.ACTIVE },
     });
 
     return receipt;
@@ -288,16 +453,20 @@ export class WarehouseService {
 
   // ─── MY RECEIPTS ──────────────────────────────────────────────────────────
   async getMyReceipts(ownerId: string) {
-    return this.prisma.warehouseReceipt.findMany({
+    const receipts = await this.prisma.warehouseReceipt.findMany({
       where: { ownerId },
       include: {
         warehouse: { select: { name: true, city: true, province: true, managerPhone: true } },
         lien: true,
         insurance: true,
-        booking: { select: { totalCost: true, includeInsurance: true } },
+        booking: { select: { totalCost: true, includeInsurance: true, bookingSeq: true, createdAt: true, status: true } },
       },
       orderBy: { createdAt: 'desc' },
     });
+    return receipts.map((r) => ({
+      ...r,
+      booking: r.booking ? withBookingReference(r.booking) : null,
+    }));
   }
 
   // ─── SINGLE RECEIPT ───────────────────────────────────────────────────────
@@ -314,7 +483,7 @@ export class WarehouseService {
     });
     if (!receipt) throw new NotFoundException('Receipt not found');
     if (receipt.ownerId !== userId) throw new ForbiddenException('Access denied');
-    return receipt;
+    return { ...receipt, booking: receipt.booking ? withBookingReference(receipt.booking) : null };
   }
 
   // ─── APPLY FOR BANK LIEN ──────────────────────────────────────────────────
@@ -472,12 +641,12 @@ export class WarehouseService {
     ]);
 
     const usedCapacity = await this.prisma.storageBooking.aggregate({
-      where: { warehouseId: warehouse.id, status: { in: ['confirmed', 'active'] } },
+      where: { warehouseId: warehouse.id, status: { in: CAPACITY_HELD_STATUSES } },
       _sum: { quantityTons: true },
     });
 
     const revenue = await this.prisma.storageBooking.aggregate({
-      where: { warehouseId: warehouse.id, status: { in: ['active', 'completed'] } },
+      where: { warehouseId: warehouse.id, status: { in: [BookingStatus.ACTIVE, BookingStatus.COMPLETED] } },
       _sum: { totalCost: true },
     });
 
@@ -494,7 +663,7 @@ export class WarehouseService {
         usedCapacityTons: usedCapacity._sum.quantityTons || 0,
         availableCapacityTons: warehouse.totalCapacityTons - (usedCapacity._sum.quantityTons || 0),
       },
-      recentBookings: bookings,
+      recentBookings: withBookingReferences(bookings),
     };
   }
 
@@ -509,7 +678,16 @@ export class WarehouseService {
     });
   }
 
+  // Admin: mark a warehouse as verified/unverified — a trust signal shown
+  // to buyers, separate from isActive (listed/delisted).
   async adminVerify(warehouseId: string, verified: boolean) {
+    // Guard added Round 2, Milestone 6 for consistency with
+    // adminSetActive just below (and with the equivalent TestingService/
+    // TransportService methods this pattern was just copied to) — a
+    // missing warehouse previously fell straight through to Prisma's raw
+    // "record to update not found" error instead of a clean 404.
+    const warehouse = await this.prisma.warehouseProfile.findUnique({ where: { id: warehouseId } });
+    if (!warehouse) throw new NotFoundException('Warehouse not found');
     return this.prisma.warehouseProfile.update({
       where: { id: warehouseId },
       data: { isVerified: verified },

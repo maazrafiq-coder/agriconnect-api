@@ -3,33 +3,61 @@ import {
   UploadedFiles, HttpCode, HttpStatus, Res, Req,
 } from '@nestjs/common';
 import { Response, Request } from 'express';
-import { FilesInterceptor } from '@nestjs/platform-express';
+import { FileFieldsInterceptor } from '@nestjs/platform-express';
 import { Throttle } from '@nestjs/throttler';
 import { AuthService } from './auth.service';
+import { StorageService } from '../common/storage/storage.service';
 import {
   RegisterDto, LoginDto, VerifyOtpDto,
   SubmitKycDto, ForgotPasswordDto, ResetPasswordDto,
   ChangePasswordDto, AdminCreateUserDto, AdminResetPasswordDto,
 } from './dto/auth.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { KycAuthGuard } from '../common/guards/kyc-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
-import { FileValidationInterceptor } from '../common/guards/file-validation.interceptor';
 import { OtpThrottleGuard } from '../common/guards/otp-throttle.guard';
 
+// Named upload slots so each document keeps its real type (previously all
+// files landed under one generic 'files' field and docType was recorded as
+// the literal string "files" for every upload — indistinguishable in the
+// admin review UI). File count limits mirror what section 5 of the fix
+// plan asks for; "otherDocument" allows a few for anything uncategorized.
+const KYC_FILE_FIELDS = [
+  { name: 'cnicFront', maxCount: 1 },
+  { name: 'cnicBack', maxCount: 1 },
+  { name: 'companyRegistration', maxCount: 1 },
+  { name: 'ntnDocument', maxCount: 1 },
+  { name: 'businessLicense', maxCount: 1 },
+  { name: 'otherDocument', maxCount: 3 },
+];
+
 const REFRESH_COOKIE = 'agri_refresh_token';
+
+// Frontend (Vercel) and backend (Railway/Render) run on different domains,
+// so every request between them is cross-site. Cross-site cookies REQUIRE
+// SameSite=None + Secure=true or the browser drops them silently — this was
+// the root cause of "admin logged out after refresh" (Lax cookies are not
+// sent on background fetch/XHR across sites, only on top-level navigation).
+// In local dev, frontend and backend are both on localhost (same-site), so
+// Lax + non-Secure still works there — Chrome also refuses Secure cookies
+// over plain http://localhost, which is why this must stay conditional.
+const IS_PROD = process.env.NODE_ENV === 'production';
 const REFRESH_COOKIE_OPTS = {
   httpOnly: true,
-  secure: process.env.NODE_ENV === 'production',
-  sameSite: 'lax' as const,
+  secure: IS_PROD,
+  sameSite: (IS_PROD ? 'none' : 'lax') as 'none' | 'lax',
   path: '/api/v1/auth',
   maxAge: 7 * 24 * 60 * 60 * 1000,
 };
 
 @Controller('auth')
 export class AuthController {
-  constructor(private readonly authService: AuthService) {}
+  constructor(
+    private readonly authService: AuthService,
+    private readonly storage: StorageService,
+  ) {}
 
   private setRefreshCookie(res: Response, refreshToken: string) {
     res.cookie(REFRESH_COOKIE, refreshToken, REFRESH_COOKIE_OPTS);
@@ -82,21 +110,61 @@ export class AuthController {
     return { message: 'Logged out successfully' };
   }
 
+  // KycAuthGuard (not plain JwtAuthGuard): a user who has just verified
+  // their OTP is not logged in yet — login is gated on admin approval — so
+  // they authenticate here with the short-lived registration token issued
+  // by verify-otp instead. Already-approved users revisiting their
+  // documents from My Portal use their normal login the same as any other
+  // authenticated route; KycAuthGuard accepts either.
   @Post('kyc/submit')
-  @UseGuards(JwtAuthGuard)
-  @UseInterceptors(FilesInterceptor('files', 5), FileValidationInterceptor)
+  @UseGuards(KycAuthGuard)
+  @UseInterceptors(FileFieldsInterceptor(KYC_FILE_FIELDS))
   submitKyc(
     @CurrentUser('id') userId: string,
     @Body() dto: SubmitKycDto,
-    @UploadedFiles() files: Express.Multer.File[],
+    @UploadedFiles() filesByField: Record<string, Express.Multer.File[]>,
   ) {
-    return this.authService.submitKyc(userId, dto, files || []);
+    const files = Object.values(filesByField || {}).flat();
+    return this.authService.submitKyc(userId, dto, files);
   }
 
   @Get('kyc/status')
-  @UseGuards(JwtAuthGuard)
+  @UseGuards(KycAuthGuard)
   getKycStatus(@CurrentUser('id') userId: string) {
     return this.authService.getKycStatus(userId);
+  }
+
+  // Issues a short-lived signed URL to view ONE specific document.
+  // Requires a normal login (not the registration token — a user only
+  // needs this once they're revisiting their own documents later, or an
+  // admin/moderator is reviewing someone else's), and re-checks
+  // ownership/role every time it's called — see AuthService for the
+  // actual check.
+  @Get('kyc/documents/:docId/signed-url')
+  @UseGuards(JwtAuthGuard)
+  getKycDocumentSignedUrl(
+    @Param('docId') docId: string,
+    @CurrentUser('id') userId: string,
+    @CurrentUser('role') role: string,
+  ) {
+    return this.authService.getKycDocumentSignedUrl(userId, role, docId);
+  }
+
+  // Serves the actual file bytes for a signed URL issued above.
+  // Deliberately NOT behind JwtAuthGuard — it's opened as a plain URL
+  // (new tab / <img src>), which can't attach an Authorization header.
+  // The signed, short-lived token in the path IS the credential; see
+  // AuthService.resolveKycFileToken for the verification.
+  //
+  // Round 2, Milestone 4: no longer streams bytes from local disk —
+  // redirects to a fresh, short-lived presigned bucket URL. The 302 is
+  // transparent to both `<img src>` and "open in new tab" usage.
+  @Get('kyc/documents/file/:token')
+  async serveKycFile(@Param('token') token: string, @Res() res: Response) {
+    const { s3Key } = await this.authService.resolveKycFileToken(token);
+    const presignedUrl = await this.storage.getPresignedUrl(s3Key, 60);
+    res.set({ 'Cache-Control': 'private, no-store' }); // never cache a document behind a one-time link
+    return res.redirect(presignedUrl);
   }
 
   @Post('forgot-password')

@@ -4,6 +4,7 @@ import {
 import {
   WarehouseService, CreateWarehouseDto, BookStorageDto,
   WarehouseQueryDto, ApplyLienDto, BuyInsuranceDto,
+  RejectBookingDto, CancelBookingDto,
 } from './warehouse.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
@@ -37,11 +38,59 @@ export class WarehouseController {
     return this.warehouseService.create(userId, dto);
   }
 
-  // POST /warehouse/book — book storage
+  // POST /warehouse/book — book storage (creates a REQUESTED booking;
+  // the warehouse operator must accept it before goods should be delivered)
   @Post('book')
   @UseGuards(JwtAuthGuard)
   book(@CurrentUser('id') userId: string, @Body() dto: BookStorageDto) {
     return this.warehouseService.bookStorage(userId, dto);
+  }
+
+  // GET /warehouse/bookings/my — buyer's own booking requests, with status
+  @Get('bookings/my')
+  @UseGuards(JwtAuthGuard)
+  getMyBookings(@CurrentUser('id') userId: string) {
+    return this.warehouseService.getMyBookings(userId);
+  }
+
+  // GET /warehouse/bookings/:id — single booking (buyer, operator, or admin)
+  @Get('bookings/:id')
+  @UseGuards(JwtAuthGuard)
+  getBooking(@Param('id') id: string, @CurrentUser('id') userId: string, @CurrentUser('role') role: string) {
+    return this.warehouseService.getBooking(id, userId, role);
+  }
+
+  // PATCH /warehouse/bookings/:id/accept — warehouse operator accepts a REQUESTED booking
+  @Patch('bookings/:id/accept')
+  @UseGuards(JwtAuthGuard)
+  acceptBooking(@Param('id') id: string, @CurrentUser('id') userId: string) {
+    return this.warehouseService.acceptBooking(userId, id);
+  }
+
+  // PATCH /warehouse/bookings/:id/reject — warehouse operator declines a REQUESTED booking
+  @Patch('bookings/:id/reject')
+  @UseGuards(JwtAuthGuard)
+  rejectBooking(@Param('id') id: string, @CurrentUser('id') userId: string, @Body() dto: RejectBookingDto) {
+    return this.warehouseService.rejectBooking(userId, id, dto);
+  }
+
+  // PATCH /warehouse/bookings/:id/cancel — depositor or operator withdraws before goods arrive
+  @Patch('bookings/:id/cancel')
+  @UseGuards(JwtAuthGuard)
+  cancelBooking(
+    @Param('id') id: string,
+    @CurrentUser('id') userId: string,
+    @CurrentUser('role') role: string,
+    @Body() dto: CancelBookingDto,
+  ) {
+    return this.warehouseService.cancelBooking(userId, role, id, dto);
+  }
+
+  // PATCH /warehouse/bookings/:id/complete — operator marks booking complete (goods released)
+  @Patch('bookings/:id/complete')
+  @UseGuards(JwtAuthGuard)
+  completeBooking(@Param('id') id: string, @CurrentUser('id') userId: string) {
+    return this.warehouseService.completeBooking(userId, id);
   }
 
   // GET /warehouse/receipts/my — my digital warehouse receipts

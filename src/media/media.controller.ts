@@ -3,12 +3,9 @@ import {
   UseGuards, UseInterceptors, UploadedFiles,
 } from '@nestjs/common';
 import { FilesInterceptor } from '@nestjs/platform-express';
-import { diskStorage } from 'multer';
-import { extname } from 'path';
 import { MediaService } from './media.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
-import { FileValidationInterceptor } from '../common/guards/file-validation.interceptor';
 
 @Controller('media')
 export class MediaController {
@@ -21,20 +18,12 @@ export class MediaController {
   }
 
   // POST /media/:entityType/:entityId — upload photos or documents (owner only)
+  //
+  // Round 2, Milestone 4: storage engine now configured at module level
+  // (see media.module.ts) — see auth.module.ts for full reasoning.
   @Post(':entityType/:entityId')
   @UseGuards(JwtAuthGuard)
-  @UseInterceptors(
-    FilesInterceptor('files', 10, {
-      storage: diskStorage({
-        destination: './uploads/listings',
-        filename: (req, file, cb) => {
-          const unique = Date.now() + '-' + Math.round(Math.random() * 1e9);
-          cb(null, `listing-${unique}${extname(file.originalname)}`);
-        },
-      }),
-    }),
-    FileValidationInterceptor,
-  )
+  @UseInterceptors(FilesInterceptor('files', 10))
   upload(
     @Param('entityType') entityType: string,
     @Param('entityId') entityId: string,

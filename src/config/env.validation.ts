@@ -29,8 +29,20 @@ export const envValidationSchema = Joi.object({
   UPLOAD_DEST: Joi.string().default('./uploads'),
   MAX_FILE_SIZE_MB: Joi.number().default(10),
 
-  AWS_ACCESS_KEY_ID: Joi.string().allow('').optional(),
-  AWS_SECRET_ACCESS_KEY: Joi.string().allow('').optional(),
-  AWS_REGION: Joi.string().allow('').optional(),
-  AWS_S3_BUCKET: Joi.string().allow('').optional(),
+  // Round 2, Milestone 4 — Railway Storage Buckets (S3-compatible object
+  // storage) replaces local disk for every upload path (KYC docs,
+  // clarification attachments, product/listing media). Required in
+  // production so the app refuses to boot rather than silently accepting
+  // uploads it can't actually persist; optional in dev/test so the
+  // existing PrismaService-stub test pattern (which never touches a real
+  // bucket) and sandboxes without bucket credentials keep working.
+  AWS_ACCESS_KEY_ID: Joi.string().when('NODE_ENV', { is: 'production', then: Joi.required(), otherwise: Joi.allow('').optional() }),
+  AWS_SECRET_ACCESS_KEY: Joi.string().when('NODE_ENV', { is: 'production', then: Joi.required(), otherwise: Joi.allow('').optional() }),
+  AWS_REGION: Joi.string().allow('').optional().default('auto'),
+  AWS_S3_BUCKET: Joi.string().when('NODE_ENV', { is: 'production', then: Joi.required(), otherwise: Joi.allow('').optional() }),
+  // Railway Storage Buckets' S3-compatible endpoint (from the Railway
+  // dashboard, e.g. https://storage.railway.app or a region-specific
+  // host — check the bucket's connection details). Leave unset to talk
+  // to real AWS S3 instead (e.g. if migrating off Railway later).
+  AWS_S3_ENDPOINT: Joi.string().uri().allow('').optional(),
 });

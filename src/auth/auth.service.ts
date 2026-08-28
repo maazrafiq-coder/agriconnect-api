@@ -5,6 +5,7 @@ import {
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
+import { withAgriConnectId } from '../common/utils/agri-connect-id.util';
 import * as bcrypt from 'bcrypt';
 import { v4 as uuidv4 } from 'uuid';
 import {
@@ -116,10 +117,18 @@ export class AuthService {
 
     await this.writeAuditLog(user.id, 'phone_verified', 'user', user.id);
 
+    // The user isn't logged in yet (login is gated on admin approval — see
+    // login() below) but they DO need to upload KYC documents next. Issue a
+    // short-lived, single-purpose token scoped only to the KYC endpoints
+    // (see RegistrationTokenGuard) rather than granting a real session.
+    const registrationToken = this.generateRegistrationToken(user.id);
+
     return {
       message: 'Verified! Your registration is now pending admin review before you can log in.',
       user: this.sanitizeUser(updated),
       pendingApproval: updated.kycStatus !== 'APPROVED',
+      registrationToken,
+      registrationTokenExpiresIn: this.REGISTRATION_TOKEN_TTL,
     };
   }
 
@@ -191,7 +200,11 @@ export class AuthService {
         data: {
           userId,
           docType: file.fieldname,
-          fileUrl: `/uploads/${file.filename}`,
+          // Historical field, not actually used to serve the file (KYC
+          // docs are only ever served through the signed-token endpoint
+          // below, which resolves via `s3Key`) — kept populated for
+          // readability/audit trails rather than removed outright.
+          fileUrl: `kyc/${file.fieldname}`,
           s3Key: file.filename,
           status: 'pending',
         },
@@ -433,6 +446,94 @@ export class AuthService {
     return code;
   }
 
+  // How long a post-OTP registration session stays usable for KYC document
+  // upload before the user would need to re-verify. Deliberately generous
+  // (documents take time to gather/photograph) but still short compared to
+  // a real session, and it's re-checked against live kycStatus on every
+  // request anyway (see RegistrationTokenGuard), so it can't outlive an
+  // admin decision even within this window.
+  private readonly REGISTRATION_TOKEN_TTL = '2h';
+
+  private generateRegistrationToken(userId: string): string {
+    return this.jwt.sign(
+      { sub: userId, type: 'registration' },
+      { secret: this.config.get('JWT_SECRET'), expiresIn: this.REGISTRATION_TOKEN_TTL },
+    );
+  }
+
+  // How long a signed KYC-document access URL stays valid. Short on
+  // purpose — this is meant to be used immediately (click a document,
+  // view it), not stored or shared. A new one is issued every time the
+  // frontend needs to open a document, so re-requesting after expiry
+  // costs nothing.
+  private readonly KYC_FILE_TOKEN_TTL = '5m';
+
+  // Anyone requesting to VIEW a document must either own it or be staff
+  // reviewing it. This is the only access-control check for KYC files —
+  // there is no other path to reach the underlying file (see
+  // secure-uploads/kyc, outside the public static root, and
+  // GET /auth/kyc/documents/file/:token below, which trusts nothing but
+  // this signed token).
+  async getKycDocumentSignedUrl(requesterId: string, requesterRole: string, docId: string) {
+    const doc = await this.prisma.kycDocument.findUnique({ where: { id: docId } });
+    if (!doc) throw new NotFoundException('Document not found');
+
+    const isOwner = doc.userId === requesterId;
+    const isReviewer = requesterRole === 'ADMIN' || requesterRole === 'MODERATOR';
+    if (!isOwner && !isReviewer) {
+      throw new ForbiddenException('You do not have permission to view this document');
+    }
+
+    const token = this.jwt.sign(
+      { sub: doc.id, purpose: 'kyc_file_access' },
+      { secret: this.config.get('JWT_SECRET'), expiresIn: this.KYC_FILE_TOKEN_TTL },
+    );
+    return { url: `/auth/kyc/documents/file/${token}` };
+  }
+
+  // Resolves a signed token (see above) to the object's bucket key. The
+  // token itself IS the credential here — this endpoint is intentionally
+  // reachable without a normal Authorization header, since it's opened as
+  // a plain URL (new tab / img src), which can't carry custom headers.
+  // Ownership/role was already checked once, at token-issue time; a
+  // stolen token is still only a 5-minute, single-document, read-only
+  // liability.
+  //
+  // Round 2, Milestone 4: previously resolved to a local disk path
+  // (`secure-uploads/kyc/<s3Key>`); now returns the bucket key itself,
+  // which the controller turns into a short-lived presigned bucket URL
+  // via StorageService — the actual bytes are never proxied through our
+  // server.
+  async resolveKycFileToken(token: string): Promise<{ s3Key: string; docType: string }> {
+    let payload: any;
+    try {
+      payload = this.jwt.verify(token, { secret: this.config.get('JWT_SECRET') });
+    } catch {
+      throw new UnauthorizedException('This document link has expired. Please request it again.');
+    }
+    if (payload?.purpose !== 'kyc_file_access') {
+      throw new UnauthorizedException('Invalid document link.');
+    }
+
+    const doc = await this.prisma.kycDocument.findUnique({ where: { id: payload.sub } });
+    if (!doc?.s3Key) throw new NotFoundException('Document not found');
+
+    // s3Key is server-generated (see s3-multer-storage.ts) — always
+    // "<folder>/<generated-name>" — never user input. We still refuse
+    // anything containing ".." as defense in depth against path
+    // traversal, in case that assumption ever changes. (Unlike the old
+    // disk-based check, a "/" is now expected and fine — it separates
+    // the bucket folder from the filename.)
+    if (doc.s3Key.includes('..')) {
+      throw new NotFoundException('Document not found');
+    }
+
+    return {
+      s3Key: doc.s3Key,
+      docType: doc.docType,
+    };
+  }
+
   private generateTempPassword(): string {
     // Readable-ish temporary password: Agri + 6 random alphanumerics
     return 'Agri' + Math.random().toString(36).slice(-6) + '!1';
@@ -467,7 +568,7 @@ export class AuthService {
 
   private sanitizeUser(user: any) {
     const { passwordHash, ...safe } = user;
-    return safe;
+    return withAgriConnectId(safe);
   }
 
   private async writeAuditLog(userId: string | null, action: string, entityType?: string, entityId?: string, details?: any) {

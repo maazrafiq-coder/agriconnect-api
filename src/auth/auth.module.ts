@@ -3,11 +3,13 @@ import { JwtModule } from '@nestjs/jwt';
 import { PassportModule } from '@nestjs/passport';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { MulterModule } from '@nestjs/platform-express';
-import { diskStorage } from 'multer';
-import { extname } from 'path';
+import { s3MulterStorage } from '../common/storage/s3-multer-storage';
 import { AuthService } from './auth.service';
 import { AuthController } from './auth.controller';
 import { JwtStrategy } from './strategies/jwt.strategy';
+import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { RegistrationTokenGuard } from '../common/guards/registration-token.guard';
+import { KycAuthGuard } from '../common/guards/kyc-auth.guard';
 
 @Module({
   imports: [
@@ -20,24 +22,29 @@ import { JwtStrategy } from './strategies/jwt.strategy';
         signOptions: { expiresIn: config.get('JWT_EXPIRES_IN') || '15m' },
       }),
     }),
-    MulterModule.register({
-      storage: diskStorage({
-        destination: './uploads/kyc',
-        filename: (req, file, cb) => {
-          const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-          cb(null, `${file.fieldname}-${uniqueSuffix}${extname(file.originalname)}`);
-        },
+    MulterModule.registerAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
+        // Round 2, Milestone 4: uploads now go straight to a Railway
+        // Storage Bucket instead of local disk (see
+        // common/storage/s3-multer-storage.ts) — the container
+        // filesystem is ephemeral and was silently losing every KYC
+        // document on redeploy. The bucket has no public access; KYC
+        // documents are still served exclusively through the signed,
+        // time-limited, access-checked endpoint below
+        // (getKycDocumentSignedUrl / GET /auth/kyc/documents/file/:token),
+        // which now resolves to a short-lived presigned bucket URL
+        // instead of a local file path. Content-type validation (real
+        // magic-byte check, not just extension) happens inside the
+        // storage engine itself, before anything is uploaded.
+        storage: s3MulterStorage(config, { folder: 'kyc', filenamePrefix: 'kyc' }),
+        limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
       }),
-      limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
-      fileFilter: (req, file, cb) => {
-        const allowedTypes = /jpeg|jpg|png|pdf/;
-        const ext = extname(file.originalname).toLowerCase().replace('.', '');
-        cb(null, allowedTypes.test(ext));
-      },
     }),
   ],
   controllers: [AuthController],
-  providers: [AuthService, JwtStrategy],
+  providers: [AuthService, JwtStrategy, JwtAuthGuard, RegistrationTokenGuard, KycAuthGuard],
   exports: [AuthService, JwtModule],
 })
 export class AuthModule {}

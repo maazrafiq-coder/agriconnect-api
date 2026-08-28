@@ -89,6 +89,14 @@ export class TestingController {
   adminSetActive(@Param('id') id: string, @Body('isActive') isActive: boolean) {
     return this.testingService.adminSetActive(id, isActive);
   }
+
+  // PATCH /testing/admin/:id/verify — Round 2, Milestone 6
+  @Patch('admin/:id/verify')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('ADMIN')
+  adminVerify(@Param('id') id: string, @Body('verified') verified: boolean) {
+    return this.testingService.adminVerify(id, verified);
+  }
 }
 
 // ─── TRANSPORT CONTROLLER ─────────────────────────────────────────────────────
@@ -173,5 +181,13 @@ export class TransportController {
   @Roles('ADMIN')
   adminSetActive(@Param('id') id: string, @Body('isActive') isActive: boolean) {
     return this.transportService.adminSetActive(id, isActive);
+  }
+
+  // PATCH /transport/admin/:id/verify — Round 2, Milestone 6
+  @Patch('admin/:id/verify')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('ADMIN')
+  adminVerify(@Param('id') id: string, @Body('verified') verified: boolean) {
+    return this.transportService.adminVerify(id, verified);
   }
 }

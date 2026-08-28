@@ -50,6 +50,36 @@ export class UpdateAgencyDto {
   @IsOptional() @IsArray() @IsString({ each: true }) coverageAreas?: string[];
 }
 
+// ─── TESTING REQUEST STATUS STATE MACHINE (Round 2, Milestone 7) ──────────────
+// Previously PATCH /testing/requests/:id/status accepted *any* TestingStatus
+// from *either* the requester or the agency, with zero transition rules.
+// That meant a requester (buyer) could mark their own quality test
+// COMPLETED directly — completely bypassing submitReport, the endpoint
+// that's supposed to be the only legitimate way to complete a request
+// (agency-only, and requires an actual report). COMPLETED is deliberately
+// excluded from every transition below; it's rejected explicitly in
+// updateStatus() with a message pointing at submitReport instead.
+type TestingParty = 'requester' | 'agency';
+const TESTING_TRANSITIONS: Record<TestingStatus, { to: TestingStatus; allowedParties: TestingParty[] }[]> = {
+  [TestingStatus.REQUESTED]: [
+    { to: TestingStatus.ASSIGNED, allowedParties: ['agency'] },
+    { to: TestingStatus.CANCELLED, allowedParties: ['requester', 'agency'] },
+  ],
+  [TestingStatus.ASSIGNED]: [
+    { to: TestingStatus.SAMPLE_COLLECTED, allowedParties: ['agency'] },
+    { to: TestingStatus.CANCELLED, allowedParties: ['requester', 'agency'] },
+  ],
+  [TestingStatus.SAMPLE_COLLECTED]: [
+    { to: TestingStatus.IN_PROGRESS, allowedParties: ['agency'] },
+    { to: TestingStatus.CANCELLED, allowedParties: ['agency'] },
+  ],
+  [TestingStatus.IN_PROGRESS]: [
+    { to: TestingStatus.CANCELLED, allowedParties: ['agency'] },
+  ],
+  [TestingStatus.COMPLETED]: [],
+  [TestingStatus.CANCELLED]: [],
+};
+
 @Injectable()
 export class TestingService {
   constructor(private prisma: PrismaService) {}
@@ -59,6 +89,19 @@ export class TestingService {
     const agency = await this.prisma.testingAgencyProfile.findUnique({ where: { id: agencyId } });
     if (!agency) throw new NotFoundException('Testing agency not found');
     return this.prisma.testingAgencyProfile.update({ where: { id: agencyId }, data: { isActive } });
+  }
+
+  // Admin: mark a testing agency as verified/unverified — a trust signal
+  // shown to buyers, separate from isActive (listed/delisted). Round 2,
+  // Milestone 6: this mirrors WarehouseService.adminVerify, which
+  // existed for warehouses but had no equivalent here or on
+  // TransportService, despite TestingAgencyProfile/TransportProfile
+  // both already having an `isVerified` column (used in this file's own
+  // findAllAgencies sort order below) with no way to ever set it true.
+  async adminVerify(agencyId: string, verified: boolean) {
+    const agency = await this.prisma.testingAgencyProfile.findUnique({ where: { id: agencyId } });
+    if (!agency) throw new NotFoundException('Testing agency not found');
+    return this.prisma.testingAgencyProfile.update({ where: { id: agencyId }, data: { isVerified: verified } });
   }
 
   // Admin: see ALL agencies including delisted ones (the public findAllAgencies
@@ -195,6 +238,12 @@ export class TestingService {
     const request = await this.prisma.testingRequest.findUnique({ where: { id: requestId } });
     if (!request) throw new NotFoundException('Request not found');
     if (request.agencyId !== agencyId) throw new ForbiddenException('Not your request');
+    if (request.status === TestingStatus.CANCELLED) {
+      throw new BadRequestException('Cannot submit a report for a cancelled request');
+    }
+    if (request.status === TestingStatus.COMPLETED) {
+      throw new BadRequestException('A report has already been submitted for this request');
+    }
 
     return this.prisma.testingRequest.update({
       where: { id: requestId },
@@ -210,7 +259,27 @@ export class TestingService {
   async updateStatus(requestId: string, userId: string, status: TestingStatus) {
     const request = await this.prisma.testingRequest.findUnique({ where: { id: requestId } });
     if (!request) throw new NotFoundException('Request not found');
-    if (request.agencyId !== userId && request.requesterId !== userId) throw new ForbiddenException('Access denied');
+
+    const party: TestingParty | null =
+      request.agencyId === userId ? 'agency' : request.requesterId === userId ? 'requester' : null;
+    if (!party) throw new ForbiddenException('Access denied');
+
+    if (status === TestingStatus.COMPLETED) {
+      throw new BadRequestException(
+        'A testing request can only be marked Completed by submitting a report (see POST /testing/requests/:id/report) — it cannot be set directly',
+      );
+    }
+
+    const transition = TESTING_TRANSITIONS[request.status]?.find((t) => t.to === status);
+    if (!transition) {
+      throw new BadRequestException(`Testing request cannot move from ${request.status} to ${status}`);
+    }
+    if (!transition.allowedParties.includes(party)) {
+      throw new ForbiddenException(
+        `Only the ${transition.allowedParties.join(' or ')} can move this request from ${request.status} to ${status}`,
+      );
+    }
+
     return this.prisma.testingRequest.update({ where: { id: requestId }, data: { status } });
   }
 }
@@ -275,6 +344,15 @@ export class TransportService {
     const provider = await this.prisma.transportProfile.findUnique({ where: { id: providerId } });
     if (!provider) throw new NotFoundException('Transport provider not found');
     return this.prisma.transportProfile.update({ where: { id: providerId }, data: { isActive } });
+  }
+
+  // Admin: mark a transport provider as verified/unverified — see
+  // TestingService.adminVerify above for the full reasoning. Round 2,
+  // Milestone 6.
+  async adminVerify(providerId: string, verified: boolean) {
+    const provider = await this.prisma.transportProfile.findUnique({ where: { id: providerId } });
+    if (!provider) throw new NotFoundException('Transport provider not found');
+    return this.prisma.transportProfile.update({ where: { id: providerId }, data: { isVerified: verified } });
   }
 
   async adminFindAll() {

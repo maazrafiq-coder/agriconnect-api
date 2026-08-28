@@ -30,11 +30,13 @@ enum UserRole {
 }
 
 enum KycStatus {
-  PENDING       // just registered, nothing submitted yet
-  SUBMITTED     // registration/docs submitted, awaiting any review
-  RECOMMENDED   // a moderator reviewed it and recommends approval —
-                // still requires ADMIN to actually approve
-  APPROVED      // can log in
+  PENDING         // just registered, nothing submitted yet
+  SUBMITTED       // registration/docs submitted, awaiting any review
+  RECOMMENDED     // a moderator reviewed it and recommends approval —
+                  // still requires ADMIN to actually approve
+  INFO_REQUESTED  // admin needs more from the user before deciding —
+                  // see User.kycInfoRequestNote
+  APPROVED        // can log in
   REJECTED
 }
 
@@ -103,7 +105,10 @@ enum RiceStage {
 
 enum ProductStatus {
   DRAFT
+  PENDING_REVIEW  // submitted, awaiting admin approval before going live
   ACTIVE
+  REJECTED        // admin declined it — see Product.rejectionNote. Editing
+                   // a rejected listing moves it back to PENDING_REVIEW.
   UNDER_OFFER
   SOLD
   PAUSED
@@ -163,6 +168,20 @@ enum ReceiptStatus {
   EXPIRED
 }
 
+// Round 2 Milestone 2: real warehouse booking lifecycle. Previously
+// StorageBooking.status was a free-text string that only ever held
+// "confirmed" or "active" — no operator accept/reject step existed at
+// all, meaning a buyer's booking request was instantly treated as
+// confirmed with no warehouse involvement. See StorageBooking.status.
+enum BookingStatus {
+  REQUESTED  // buyer submitted a booking request; warehouse has not acted on it yet
+  ACCEPTED   // warehouse operator accepted — buyer should now deliver goods
+  REJECTED   // warehouse operator declined the request (see StorageBooking.rejectionReason)
+  ACTIVE     // goods have arrived and a Digital Warehouse Receipt was issued
+  COMPLETED  // goods have been released / booking lifecycle finished
+  CANCELLED  // withdrawn by depositor or operator before goods arrived
+}
+
 enum LienStatus {
   ACTIVE
   RELEASED
@@ -212,12 +231,68 @@ enum NotificationType {
   SYSTEM
 }
 
+// Round 2 Milestone 3: a real two-way clarification workflow. Previously
+// "request more info" on KYC was a single free-text note
+// (User.kycInfoRequestNote) with no way for the user to reply, no
+// attachments, and no history if it happened more than once. This model
+// is deliberately generic — `subjectType`/`subjectId` instead of a hard
+// FK to User — so the exact same request/respond/resolve flow, file
+// attachments, and admin UI can be reused for warehouse/testing-agency/
+// transport provider review in a later milestone without a second
+// purpose-built table per subject type. USER_KYC is the only subjectType
+// wired up so far.
+enum ClarificationStatus {
+  OPEN        // admin asked, waiting on the subject's response
+  RESPONDED   // subject responded, awaiting the reviewer's next look
+  RESOLVED    // reviewer marked it resolved (used to help decide approve/reject)
+}
+
+model ReviewClarification {
+  id              String   @id @default(uuid())
+  subjectType     String   // "USER_KYC" today; reserved: "WAREHOUSE_PROFILE" | "TESTING_AGENCY_PROFILE" | "TRANSPORT_PROFILE"
+  subjectId       String   // id of the row identified by subjectType (e.g. User.id for USER_KYC)
+  requestedById   String   // admin/moderator who asked
+  requestMessage  String
+  status          ClarificationStatus @default(OPEN)
+  responseMessage String?
+  respondedAt     DateTime?
+  resolvedById    String?
+  resolvedAt      DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  attachments     ClarificationAttachment[]
+
+  @@index([subjectType, subjectId])
+  @@index([status])
+  @@map("review_clarifications")
+}
+
+model ClarificationAttachment {
+  id              String   @id @default(uuid())
+  clarificationId String
+  uploadedById    String   // whoever attached it — the subject when responding, or a reviewer
+  fileName        String   // original filename, for display
+  s3Key           String   // server-generated on-disk filename — never user input
+  createdAt       DateTime @default(now())
+
+  clarification   ReviewClarification @relation(fields: [clarificationId], references: [id], onDelete: Cascade)
+
+  @@index([clarificationId])
+  @@map("clarification_attachments")
+}
+
 // ─── USER & IDENTITY ──────────────────────────────────────────────────────────
 // Rule: User owns identity only. All domain back-relations live on
 // the respective profile model, not on User.
 
 model User {
   id               String    @id @default(uuid())
+  // Human-readable, unique, immutable ID (formatted as "AGC-000001" — see
+  // formatAgriConnectId()). Backed by a native Postgres sequence via
+  // @default(autoincrement()), so it's assigned atomically at creation
+  // with no risk of collisions or gaps under concurrent registrations.
+  agriConnectSeq   Int       @unique @default(autoincrement())
   phoneNumber      String?   @unique  // optional — user must provide phone OR email (enforced in service layer)
   email            String?   @unique
   passwordHash     String
@@ -229,6 +304,15 @@ model User {
   kycApprovedAt    DateTime?
   kycRejectedAt    DateTime?
   kycRejectionNote String?
+  // Set when an admin uses "Request Additional Information" instead of a
+  // straight approve/reject. This pair is a denormalized cache of the
+  // *latest* request for cheap display in list views (admin user list,
+  // the user's own account page) without an extra join — the full
+  // two-way thread (every request, the user's response, attachments,
+  // resolution) lives in ReviewClarification (subjectType: "USER_KYC",
+  // subjectId: this User's id), which is the actual source of truth.
+  kycInfoRequestNote String?
+  kycInfoRequestedAt DateTime?
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @updatedAt
 
@@ -372,6 +456,7 @@ model Product {
   packagingType    String?
   deliveryTerms    String?
   status           ProductStatus   @default(DRAFT)
+  rejectionNote    String?         // set by admin when status = REJECTED
   viewCount        Int             @default(0)
   createdAt        DateTime        @default(now())
   updatedAt        DateTime        @updatedAt
@@ -603,7 +688,14 @@ model WarehouseProfile {
 }
 
 model StorageBooking {
-  id               String   @id @default(uuid())
+  id               String        @id @default(uuid())
+  // Human-readable, unique, immutable booking reference (e.g.
+  // "WHB-2026-000001"), derived from bookingSeq the same way a User's
+  // AgriConnect ID is derived from agriConnectSeq — see
+  // src/common/utils/booking-reference.util.ts. A native Postgres
+  // autoincrement sequence guarantees atomic, collision-free uniqueness
+  // under concurrent bookings with no extra locking.
+  bookingSeq       Int           @unique @default(autoincrement())
   warehouseId      String   // FK → WarehouseProfile.id
   depositorId      String   // FK → User.id (the person storing goods)
   commodity        String
@@ -615,7 +707,15 @@ model StorageBooking {
   exitDate         DateTime
   pricePerTon      Decimal  @db.Decimal(10, 2)
   totalCost        Decimal  @db.Decimal(14, 2)
-  status           String   @default("confirmed")
+  status           BookingStatus @default(REQUESTED)
+  // Set when the warehouse operator rejects a REQUESTED booking.
+  rejectionReason  String?
+  // Set when the depositor or operator cancels a REQUESTED/ACCEPTED booking.
+  cancelReason     String?
+  acceptedAt       DateTime?
+  rejectedAt       DateTime?
+  cancelledAt      DateTime?
+  completedAt      DateTime?
   includeInsurance Boolean  @default(false)
   notes            String?
   createdAt        DateTime @default(now())
@@ -627,6 +727,7 @@ model StorageBooking {
 
   @@index([warehouseId])
   @@index([depositorId])
+  @@index([status])
   @@map("storage_bookings")
 }
 

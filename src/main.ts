@@ -4,9 +4,25 @@ import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import helmet from 'helmet';
 import * as compression from 'compression';
 import * as cookieParser from 'cookie-parser';
+import { mkdirSync } from 'fs';
 import { AppModule } from './app.module';
 
+// Multer's diskStorage does NOT create missing destination directories —
+// it throws ENOENT on the first upload if they don't already exist. These
+// were previously only relying on the directories having been created
+// once, manually, on whatever host happened to run this — which is also
+// exactly why the plan flags the uploads path as needing a persistent
+// Railway volume (a fresh container has no memory of a manual mkdir).
+// Creating them at boot, every boot, means a fresh deploy or volume mount
+// never silently breaks uploads again.
+function ensureUploadDirsExist() {
+  const dirs = ['./uploads/products', './uploads/listings', './secure-uploads/kyc'];
+  for (const dir of dirs) mkdirSync(dir, { recursive: true });
+}
+
 async function bootstrap() {
+  ensureUploadDirsExist();
+
   const app = await NestFactory.create(AppModule);
 
   // ─── SECURITY HEADERS ───────────────────────────────────────────────────────

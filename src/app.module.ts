@@ -6,6 +6,7 @@ import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
 import { join } from 'path';
 
 import { PrismaModule } from './prisma/prisma.module';
+import { StorageModule } from './common/storage/storage.module';
 import { AuthModule } from './auth/auth.module';
 import { UsersModule } from './users/users.module';
 import { ProductsModule } from './products/products.module';
@@ -16,6 +17,7 @@ import { HealthModule } from './health/health.module';
 import { CategoriesModule } from './categories/categories.module';
 import { CatalogModule } from './catalog/catalog.module';
 import { MediaModule } from './media/media.module';
+import { ReviewModule } from './review/review.module';
 import { AllExceptionsFilter } from './common/filters/http-exception.filter';
 import { envValidationSchema } from './config/env.validation';
 
@@ -28,7 +30,13 @@ import { envValidationSchema } from './config/env.validation';
     // Stricter per-route limits (e.g. OTP) are applied via @Throttle() overrides.
     ThrottlerModule.forRoot([{ ttl: 60000, limit: 60 }]),
 
-    // Serve uploaded files statically
+    // Legacy local-disk uploads only. As of Round 2 Milestone 4, new
+    // product/listing media uploads go to a Railway Storage Bucket
+    // (see StorageModule) and are served via presigned URLs instead —
+    // this static route only still serves whatever, if anything,
+    // survived on disk from before that migration (the container
+    // filesystem is ephemeral, so in practice most of this is gone
+    // after any redeploy).
     ServeStaticModule.forRoot({
       rootPath: join(__dirname, '..', 'uploads'),
       serveRoot: '/uploads',
@@ -36,6 +44,7 @@ import { envValidationSchema } from './config/env.validation';
 
     // Core modules
     PrismaModule,
+    StorageModule,
     AuthModule,
     UsersModule,
     ProductsModule,
@@ -46,6 +55,7 @@ import { envValidationSchema } from './config/env.validation';
     CategoriesModule,
     CatalogModule,
     MediaModule,
+    ReviewModule,
   ],
   providers: [
     // Global exception filter

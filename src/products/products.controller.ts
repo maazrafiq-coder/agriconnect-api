@@ -3,9 +3,6 @@ import {
   UseGuards, UploadedFiles, UseInterceptors,
 } from '@nestjs/common';
 import { FilesInterceptor } from '@nestjs/platform-express';
-import { diskStorage } from 'multer';
-import { extname } from 'path';
-import { FileValidationInterceptor } from '../common/guards/file-validation.interceptor';
 import { ProductsService } from './products.service';
 import { CreateProductDto, UpdateProductDto, ProductQueryDto } from './dto/product.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
@@ -74,20 +71,18 @@ export class ProductsController {
   }
 
   // POST /products/:id/media — upload images/docs
+  //
+  // Round 2, Milestone 4: storage engine (S3 bucket vs. local disk) is
+  // now configured once at the module level (see products.module.ts)
+  // rather than inline here, matching the auth/review modules'
+  // MulterModule.registerAsync pattern. Content-type magic-byte
+  // validation now happens inside that storage engine itself before
+  // the upload is persisted, so the separate FileValidationInterceptor
+  // (which checked bytes only after they'd already been written to
+  // disk) is no longer needed here.
   @Post(':id/media')
   @UseGuards(JwtAuthGuard)
-  @UseInterceptors(
-    FilesInterceptor('files', 10, {
-      storage: diskStorage({
-        destination: './uploads/products',
-        filename: (req, file, cb) => {
-          const unique = Date.now() + '-' + Math.round(Math.random() * 1e9);
-          cb(null, `product-${unique}${extname(file.originalname)}`);
-        },
-      }),
-    }),
-  )
-  @UseInterceptors(FileValidationInterceptor)
+  @UseInterceptors(FilesInterceptor('files', 10))
   addMedia(
     @Param('id') id: string,
     @CurrentUser('id') userId: string,
@@ -123,6 +118,22 @@ export class ProductsController {
     @Query('limit') limit = 20,
   ) {
     return this.productsService.adminFindAll(status, +page, +limit);
+  }
+
+  // PATCH /products/admin/:id/approve — approve a pending listing (first time it goes live)
+  @Patch('admin/:id/approve')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('ADMIN')
+  adminApprove(@Param('id') id: string) {
+    return this.productsService.adminApprove(id);
+  }
+
+  // PATCH /products/admin/:id/reject — decline a pending listing (seller can edit + resubmit)
+  @Patch('admin/:id/reject')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('ADMIN')
+  adminReject(@Param('id') id: string, @Body('reason') reason: string) {
+    return this.productsService.adminReject(id, reason || 'No reason provided');
   }
 
   // PATCH /products/admin/:id/remove — remove a fraudulent/policy-violating listing

@@ -118,3 +118,42 @@ describe('WarehouseService.applyLien', () => {
     );
   });
 });
+
+/**
+ * Round 2, Milestone 6 — provider account fixes. adminVerify previously
+ * had no existence guard (unlike its sibling adminSetActive) and would
+ * fall straight through to a raw Prisma "record not found" error on a
+ * missing warehouse instead of a clean 404 — this covers the fix.
+ */
+describe('WarehouseService.adminVerify', () => {
+  let service: WarehouseService;
+  let prisma: any;
+
+  beforeEach(async () => {
+    prisma = {
+      warehouseProfile: {
+        findUnique: jest.fn().mockResolvedValue({ id: 'wh-1', isVerified: false }),
+        update: jest.fn().mockImplementation(({ where, data }) => Promise.resolve({ id: where.id, ...data })),
+      },
+    };
+    const moduleRef = await Test.createTestingModule({
+      providers: [WarehouseService, { provide: PrismaService, useValue: prisma }],
+    }).compile();
+    service = moduleRef.get(WarehouseService);
+  });
+
+  it('marks an existing warehouse as verified', async () => {
+    const result = await service.adminVerify('wh-1', true);
+    expect(prisma.warehouseProfile.update).toHaveBeenCalledWith({
+      where: { id: 'wh-1' },
+      data: { isVerified: true },
+    });
+    expect(result.isVerified).toBe(true);
+  });
+
+  it('404s on a missing warehouse rather than a raw Prisma error', async () => {
+    prisma.warehouseProfile.findUnique.mockResolvedValue(null);
+    await expect(service.adminVerify('ghost-wh', true)).rejects.toThrow(NotFoundException);
+    expect(prisma.warehouseProfile.update).not.toHaveBeenCalled();
+  });
+});

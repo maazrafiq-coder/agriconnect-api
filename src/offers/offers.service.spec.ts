@@ -28,7 +28,19 @@ describe('OffersService.accept', () => {
         findUnique: jest.fn().mockResolvedValue(baseOffer),
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
       },
-      $transaction: jest.fn(),
+      order: {
+        create: jest.fn().mockResolvedValue({
+          id: 'order-1',
+          offerId: 'offer-1',
+          sellerId: 'seller-1',
+          buyerId: 'buyer-1',
+          totalAmount: 380000,
+          platformFee: 7600,
+          netSellerAmount: 372400,
+          status: OrderStatus.CONFIRMED,
+        }),
+      },
+      $transaction: jest.fn().mockImplementation((ops) => Promise.all(ops)),
       transaction: { createMany: jest.fn().mockResolvedValue({}) },
     };
 

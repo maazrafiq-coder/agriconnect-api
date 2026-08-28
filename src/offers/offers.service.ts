@@ -194,6 +194,38 @@ export class OffersService {
   }
 }
 
+// ─── ORDER STATUS STATE MACHINE (Round 2, Milestone 7) ────────────────────────
+// Previously PATCH /orders/:id/status accepted *any* OrderStatus value from
+// *either* party to the order with zero transition rules — a buyer or seller
+// could jump an order straight to COMPLETED, or quietly move it out of
+// DISPUTED before an admin ever resolved it, sidestepping
+// OrdersService.adminResolveDispute entirely. This mirrors the explicit
+// allow-list pattern WarehouseService already uses for booking status
+// (see ALLOWED_TRANSITIONS there) — each transition names which party
+// (seller, buyer, or both) is permitted to make it. DISPUTED is
+// deliberately terminal here: only the admin-only resolve-dispute endpoint
+// can move an order out of DISPUTED.
+type OrderParty = 'seller' | 'buyer';
+const ORDER_TRANSITIONS: Record<OrderStatus, { to: OrderStatus; allowedParties: OrderParty[] }[]> = {
+  [OrderStatus.PENDING]: [],
+  [OrderStatus.CONFIRMED]: [
+    { to: OrderStatus.IN_TRANSIT, allowedParties: ['seller'] },
+    { to: OrderStatus.CANCELLED, allowedParties: ['seller', 'buyer'] },
+    { to: OrderStatus.DISPUTED, allowedParties: ['seller', 'buyer'] },
+  ],
+  [OrderStatus.IN_TRANSIT]: [
+    { to: OrderStatus.DELIVERED, allowedParties: ['buyer'] },
+    { to: OrderStatus.DISPUTED, allowedParties: ['seller', 'buyer'] },
+  ],
+  [OrderStatus.DELIVERED]: [
+    { to: OrderStatus.COMPLETED, allowedParties: ['buyer'] },
+    { to: OrderStatus.DISPUTED, allowedParties: ['seller', 'buyer'] },
+  ],
+  [OrderStatus.COMPLETED]: [],
+  [OrderStatus.CANCELLED]: [],
+  [OrderStatus.DISPUTED]: [], // only OrdersService.adminResolveDispute may move out of DISPUTED
+};
+
 // ─── ORDERS SERVICE ───────────────────────────────────────────────────────────
 @Injectable()
 export class OrdersService {
@@ -246,10 +278,36 @@ export class OrdersService {
   async updateStatus(orderId: string, userId: string, status: OrderStatus, note?: string) {
     const order = await this.prisma.order.findUnique({ where: { id: orderId } });
     if (!order) throw new NotFoundException('Order not found');
-    if (order.sellerId !== userId && order.buyerId !== userId) throw new ForbiddenException('Access denied');
+
+    const party: OrderParty | null =
+      order.sellerId === userId ? 'seller' : order.buyerId === userId ? 'buyer' : null;
+    if (!party) throw new ForbiddenException('Access denied');
+
+    if (order.status === OrderStatus.DISPUTED) {
+      throw new BadRequestException(
+        'This order is under dispute review — only an admin can change its status from here',
+      );
+    }
+
+    const transition = ORDER_TRANSITIONS[order.status]?.find((t) => t.to === status);
+    if (!transition) {
+      throw new BadRequestException(`Order cannot move from ${order.status} to ${status}`);
+    }
+    if (!transition.allowedParties.includes(party)) {
+      throw new ForbiddenException(
+        `Only the ${transition.allowedParties.join(' or ')} can move an order from ${order.status} to ${status}`,
+      );
+    }
+
+    const extraData: Record<string, any> = {};
+    if (status === OrderStatus.COMPLETED) extraData.completedAt = new Date();
+    if (status === OrderStatus.CANCELLED) {
+      extraData.cancelledAt = new Date();
+      extraData.cancelReason = note;
+    }
 
     const [updated] = await this.prisma.$transaction([
-      this.prisma.order.update({ where: { id: orderId }, data: { status } }),
+      this.prisma.order.update({ where: { id: orderId }, data: { status, ...extraData } }),
       this.prisma.orderStatusHistory.create({
         data: { orderId, status, changedBy: userId, note },
       }),

@@ -1,5 +1,7 @@
 import { Injectable, NotFoundException, ForbiddenException, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { StorageService } from '../common/storage/storage.service';
+import { withResolvedMediaUrls } from '../common/storage/media-url.util';
 
 const VALID_ENTITY_TYPES = ['warehouse', 'testing_agency', 'transport'] as const;
 type EntityType = typeof VALID_ENTITY_TYPES[number];
@@ -12,7 +14,10 @@ type EntityType = typeof VALID_ENTITY_TYPES[number];
  */
 @Injectable()
 export class MediaService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private storage: StorageService,
+  ) {}
 
   private async assertOwnership(entityType: EntityType, entityId: string, userId: string) {
     let ownerId: string | undefined;
@@ -47,6 +52,11 @@ export class MediaService {
             entityType,
             entityId,
             type,
+            // `url` is a placeholder for newly-uploaded (bucket-backed)
+            // media — the real URL is a presigned bucket link generated
+            // fresh on every read (see list() / withResolvedMediaUrls).
+            // `s3Key` (with folder prefix, e.g. "listings/listing-...")
+            // is the source of truth going forward.
             url: `/uploads/listings/${file.filename}`,
             s3Key: file.filename,
             uploadedBy: userId,
@@ -58,14 +68,15 @@ export class MediaService {
         })
       )
     );
-    return created;
+    return withResolvedMediaUrls(this.storage, created);
   }
 
   async list(entityType: EntityType, entityId: string) {
-    return this.prisma.listingMedia.findMany({
+    const items = await this.prisma.listingMedia.findMany({
       where: { entityType, entityId },
       orderBy: [{ isPrimary: 'desc' }, { sortOrder: 'asc' }],
     });
+    return withResolvedMediaUrls(this.storage, items);
   }
 
   async setPrimary(mediaId: string, userId: string) {
@@ -88,6 +99,12 @@ export class MediaService {
     if (!media) throw new NotFoundException('Media not found');
     await this.assertOwnership(media.entityType as EntityType, media.entityId, userId);
     await this.prisma.listingMedia.delete({ where: { id: mediaId } });
+    // Best-effort bucket cleanup — see StorageService.deleteObject.
+    // Legacy pre-M4 rows (bare filename, no folder in s3Key) are skipped
+    // since there's nothing in the bucket for them to delete.
+    if (this.storage.isBucketKey(media.s3Key)) {
+      await this.storage.deleteObject(media.s3Key);
+    }
     return { message: 'Removed' };
   }
 }

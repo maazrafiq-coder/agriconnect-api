@@ -2,12 +2,29 @@ import {
   Injectable, NotFoundException, ForbiddenException, BadRequestException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { StorageService } from '../common/storage/storage.service';
+import { withResolvedMediaUrls } from '../common/storage/media-url.util';
 import { CreateProductDto, UpdateProductDto, ProductQueryDto } from './dto/product.dto';
 import { ProductStatus } from '@prisma/client';
 
 @Injectable()
 export class ProductsService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private storage: StorageService,
+  ) {}
+
+  // Round 2, Milestone 4 — every product query below includes `media`
+  // (ProductMedia rows). This resolves each one's `url` to a fresh
+  // presigned bucket URL (or leaves legacy rows untouched) — see
+  // common/storage/media-url.util.ts for the full reasoning.
+  private async resolveProductMedia<T extends { media: any[] }>(product: T): Promise<T> {
+    return { ...product, media: await withResolvedMediaUrls(this.storage, product.media) };
+  }
+
+  private async resolveProductsMedia<T extends { media: any[] }>(products: T[]): Promise<T[]> {
+    return Promise.all(products.map((p) => this.resolveProductMedia(p)));
+  }
 
   // ─── CREATE ───────────────────────────────────────────────────────────────
   async create(sellerId: string, dto: CreateProductDto) {
@@ -41,7 +58,11 @@ export class ProductsService {
         askingPrice: productData.askingPrice,
         sellerId,
         harvestDate: productData.harvestDate ? new Date(productData.harvestDate) : null,
-        status: ProductStatus.ACTIVE,
+        // Listings go live only after admin review — see adminApprove()/
+        // adminReject() below. Previously this was ACTIVE immediately,
+        // meaning anything a seller submitted appeared on the public
+        // marketplace instantly with no review at all.
+        status: ProductStatus.PENDING_REVIEW,
         ...(riceDetails && {
           riceDetails: { create: riceDetails },
         }),
@@ -126,7 +147,7 @@ export class ProductsService {
     ]);
 
     return {
-      data,
+      data: await this.resolveProductsMedia(data),
       meta: { total, page, limit, totalPages: Math.ceil(total / limit) },
     };
   }
@@ -167,6 +188,7 @@ export class ProductsService {
 
     return {
       ...product,
+      media: await withResolvedMediaUrls(this.storage, product.media),
       seller: {
         ...product.seller,
         avgRating: Math.round(avgRating * 10) / 10,
@@ -182,18 +204,49 @@ export class ProductsService {
     if (!product) throw new NotFoundException('Product not found');
     if (product.sellerId !== sellerId) throw new ForbiddenException('Not your listing');
 
+    // Editing a rejected listing is how a seller "resubmits" it — sends it
+    // back to admin review rather than leaving it rejected forever, and
+    // clears the old rejection note since it no longer applies to the
+    // (presumably corrected) new version.
+    const resubmitting = product.status === ProductStatus.REJECTED;
+
     return this.prisma.product.update({
       where: { id },
-      data: { ...dto },
+      data: {
+        ...dto,
+        ...(resubmitting && { status: ProductStatus.PENDING_REVIEW, rejectionNote: null }),
+      },
       include: { riceDetails: true },
     });
   }
 
   // ─── CHANGE STATUS ────────────────────────────────────────────────────────
+  // Sellers may only toggle between a small set of safe, already-approved
+  // states — never set PENDING_REVIEW/ACTIVE/REJECTED/REMOVED directly.
+  // Without this allow-list, a seller could call this exact endpoint with
+  // { status: 'ACTIVE' } immediately after create() and bypass admin
+  // review entirely — the approval gate above means nothing if this stays
+  // wide open.
+  private static readonly SELLER_ALLOWED_TRANSITIONS: Partial<Record<ProductStatus, ProductStatus[]>> = {
+    [ProductStatus.ACTIVE]: [ProductStatus.PAUSED, ProductStatus.SOLD],
+    [ProductStatus.PAUSED]: [ProductStatus.ACTIVE, ProductStatus.SOLD],
+  };
+
   async changeStatus(id: string, sellerId: string, status: ProductStatus) {
     const product = await this.prisma.product.findUnique({ where: { id } });
     if (!product) throw new NotFoundException('Product not found');
     if (product.sellerId !== sellerId) throw new ForbiddenException('Not your listing');
+
+    const allowed = ProductsService.SELLER_ALLOWED_TRANSITIONS[product.status] || [];
+    if (!allowed.includes(status)) {
+      throw new ForbiddenException(
+        product.status === ProductStatus.PENDING_REVIEW
+          ? 'This listing is still awaiting admin review.'
+          : product.status === ProductStatus.REJECTED
+            ? 'This listing was rejected — edit and save it to resubmit for review.'
+            : `Cannot change a ${product.status} listing to ${status}.`,
+      );
+    }
 
     return this.prisma.product.update({ where: { id }, data: { status } });
   }
@@ -212,6 +265,9 @@ export class ProductsService {
           data: {
             productId,
             type,
+            // Placeholder — real URL is a presigned bucket link generated
+            // fresh on every read; `s3Key` (folder-prefixed) is the
+            // source of truth. See common/storage/media-url.util.ts.
             url: `/uploads/products/${file.filename}`,
             s3Key: file.filename,
             sortOrder: existingCount + index,
@@ -222,7 +278,7 @@ export class ProductsService {
         })
       )
     );
-    return created;
+    return withResolvedMediaUrls(this.storage, created);
   }
 
   // Sets which image shows on the listing card face — clears any previous flag first.
@@ -240,7 +296,7 @@ export class ProductsService {
 
   // ─── SELLER LISTINGS ─────────────────────────────────────────────────────
   async getSellerProducts(sellerId: string) {
-    return this.prisma.product.findMany({
+    const products = await this.prisma.product.findMany({
       where: { sellerId },
       include: {
         riceDetails: true,
@@ -252,6 +308,7 @@ export class ProductsService {
       },
       orderBy: { createdAt: 'desc' },
     });
+    return this.resolveProductsMedia(products);
   }
 
   // ─── SAVE PRODUCT ─────────────────────────────────────────────────────────
@@ -269,7 +326,7 @@ export class ProductsService {
 
   // ─── SAVED PRODUCTS ───────────────────────────────────────────────────────
   async getSavedProducts(userId: string) {
-    return this.prisma.savedProduct.findMany({
+    const saved = await this.prisma.savedProduct.findMany({
       where: { userId },
       include: {
         product: {
@@ -282,6 +339,9 @@ export class ProductsService {
       },
       orderBy: { createdAt: 'desc' },
     });
+    return Promise.all(
+      saved.map(async (s) => ({ ...s, product: await this.resolveProductMedia(s.product) })),
+    );
   }
 
   // ─── ADMIN MODERATION ─────────────────────────────────────────────────────
@@ -308,6 +368,37 @@ export class ProductsService {
     ]);
 
     return { data, meta: { total, page, limit, totalPages: Math.ceil(total / limit) } };
+  }
+
+  /**
+   * Admin approves a PENDING_REVIEW listing — this is what actually makes
+   * a listing appear on the public marketplace for the first time (see
+   * findAll(), which only ever returns status: ACTIVE).
+   */
+  async adminApprove(productId: string) {
+    const product = await this.prisma.product.findUnique({ where: { id: productId } });
+    if (!product) throw new NotFoundException('Product not found');
+    return this.prisma.product.update({
+      where: { id: productId },
+      data: { status: ProductStatus.ACTIVE, rejectionNote: null },
+    });
+  }
+
+  /**
+   * Admin declines a PENDING_REVIEW listing. Distinct from adminRemove():
+   * REJECTED means it never went live in the first place and the seller
+   * can edit + resubmit (see update(), which flips REJECTED back to
+   * PENDING_REVIEW automatically on save) — REMOVED means it WAS live and
+   * got taken down for fraud/policy violation, a heavier action with no
+   * self-service path back.
+   */
+  async adminReject(productId: string, reason: string) {
+    const product = await this.prisma.product.findUnique({ where: { id: productId } });
+    if (!product) throw new NotFoundException('Product not found');
+    return this.prisma.product.update({
+      where: { id: productId },
+      data: { status: ProductStatus.REJECTED, rejectionNote: reason },
+    });
   }
 
   /**
