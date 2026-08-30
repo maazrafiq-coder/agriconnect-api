@@ -25,36 +25,49 @@ export class AllExceptionsFilter implements ExceptionFilter {
       status = exception.getStatus();
       message = exception.getResponse();
     } else if (exception instanceof Prisma.PrismaClientKnownRequestError) {
-      // Common, diagnosable database errors — surface a real message
-      // instead of a bare "Internal server error" that gives no clue
-      // whether it's a bad request or a missing migration.
-      switch (exception.code) {
-        case 'P2002':
+      // Prisma's generated typings may expose code/meta differently
+      // depending on the installed Prisma version. Safely narrow the
+      // properties before accessing them.
+      const prismaException = exception as Prisma.PrismaClientKnownRequestError & {
+        code: string;
+        meta?: {
+          target?: string[] | string;
+        };
+      };
+
+      switch (prismaException.code) {
+        case 'P2002': {
           status = HttpStatus.CONFLICT;
-          message = `A record with this ${(exception.meta?.target as string[])?.join(', ') || 'value'} already exists`;
+
+          const target = prismaException.meta?.target;
+
+          const targetMessage = Array.isArray(target)
+            ? target.join(', ')
+            : target || 'value';
+
+          message = `A record with this ${targetMessage} already exists`;
           break;
+        }
+
         case 'P2025':
           status = HttpStatus.NOT_FOUND;
           message = 'Record not found';
           break;
+
         case 'P2021':
         case 'P2022':
-          // Table or column genuinely doesn't exist in the database — this
-          // means a schema migration (`prisma db push`) hasn't been run
-          // against this environment's database yet.
           status = HttpStatus.INTERNAL_SERVER_ERROR;
-          message = 'Database schema is out of date. Run `npx prisma db push` against this environment\'s database.';
+          message =
+            "Database schema is out of date. Run `npx prisma db push` against this environment's database.";
           break;
+
         default:
-          message = `Database error (${exception.code})`;
+          message = `Database error (${prismaException.code})`;
       }
     } else if (exception instanceof Prisma.PrismaClientValidationError) {
-      // Thrown when code calls a Prisma model/field that doesn't exist on
-      // the currently-generated client — the exact symptom of a stale
-      // Prisma Client that predates a schema change (fixed by ensuring
-      // `postinstall: prisma generate` runs on every deploy).
       status = HttpStatus.INTERNAL_SERVER_ERROR;
-      message = 'Database client is out of sync with the schema. The server needs to redeploy with a fresh `prisma generate`.';
+      message =
+        'Database client is out of sync with the schema. The server needs to redeploy with a fresh prisma generate.';
     }
 
     const errorResponse = {
@@ -66,7 +79,10 @@ export class AllExceptionsFilter implements ExceptionFilter {
     };
 
     if (status >= 500) {
-      this.logger.error(`${request.method} ${request.url}`, exception instanceof Error ? exception.stack : String(exception));
+      this.logger.error(
+        `${request.method} ${request.url}`,
+        exception instanceof Error ? exception.stack : String(exception),
+      );
     }
 
     response.status(status).json(errorResponse);
