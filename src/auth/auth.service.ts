@@ -145,7 +145,14 @@ export class AuthService {
     // before it can be used, per the required flow. Accounts admins create
     // directly are auto-approved (see adminCreateUser below), so this only
     // blocks self-registered accounts still awaiting review.
-    if (user.kycStatus !== 'APPROVED') {
+    //
+    // INFO_REQUESTED is a deliberate exception: an admin has asked this
+    // user for more information, and they can't provide it (or see why it
+    // was asked) if they're locked out of the account entirely. So these
+    // users ARE allowed to log in — they just can't transact yet (see
+    // OffersService.assertCanTransact) until an admin actually approves
+    // the account.
+    if (user.kycStatus !== 'APPROVED' && user.kycStatus !== 'INFO_REQUESTED') {
       const statusMessage = {
         PENDING: 'Please verify your OTP first.',
         SUBMITTED: 'Your registration is pending admin review. You will be able to log in once approved.',

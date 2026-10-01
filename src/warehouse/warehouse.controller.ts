@@ -2,7 +2,7 @@ import {
   Controller, Get, Post, Patch, Param, Body, Query, UseGuards,
 } from '@nestjs/common';
 import {
-  WarehouseService, CreateWarehouseDto, BookStorageDto,
+  WarehouseService, CreateWarehouseDto, UpdateWarehouseDto, BookStorageDto,
   WarehouseQueryDto, ApplyLienDto, BuyInsuranceDto,
   RejectBookingDto, CancelBookingDto,
 } from './warehouse.service';
@@ -36,6 +36,27 @@ export class WarehouseController {
   @UseGuards(JwtAuthGuard)
   register(@CurrentUser('id') userId: string, @Body() dto: CreateWarehouseDto) {
     return this.warehouseService.create(userId, dto);
+  }
+
+  // PATCH /warehouse/:id — operator edits their own warehouse's details/rates
+  @Patch(':id')
+  @UseGuards(JwtAuthGuard)
+  update(@Param('id') id: string, @CurrentUser('id') userId: string, @Body() dto: UpdateWarehouseDto) {
+    return this.warehouseService.update(userId, id, dto);
+  }
+
+  // GET /warehouse/:id/quote — live rate preview (incl. insurance) before booking
+  @Get(':id/quote')
+  quote(
+    @Param('id') id: string,
+    @Query('commodity') commodity: string,
+    @Query('quantityTons') quantityTons: string,
+    @Query('durationDays') durationDays: string,
+    @Query('includeInsurance') includeInsurance?: string,
+  ) {
+    return this.warehouseService.quoteRate(
+      id, commodity, Number(quantityTons), Number(durationDays), includeInsurance === 'true',
+    );
   }
 
   // POST /warehouse/book — book storage (creates a REQUESTED booking;
@@ -119,6 +140,112 @@ export class WarehouseController {
     return this.warehouseService.issueReceipt(userId, bookingId, qualityMetrics, actualQuantityTons);
   }
 
+  // ─── INVOICE (NEW_Changes item 10) ──────────────────────────────────────────
+
+  // POST /warehouse/bookings/:bookingId/invoice — operator generates & "sends" an invoice
+  @Post('bookings/:bookingId/invoice')
+  @UseGuards(JwtAuthGuard)
+  generateInvoice(@Param('bookingId') bookingId: string, @CurrentUser('id') userId: string) {
+    return this.warehouseService.generateInvoice(userId, bookingId);
+  }
+
+  // GET /warehouse/invoices/my — depositor's own invoices (must precede :id)
+  @Get('invoices/my')
+  @UseGuards(JwtAuthGuard)
+  getMyInvoices(@CurrentUser('id') userId: string) {
+    return this.warehouseService.getMyInvoices(userId);
+  }
+
+  // GET /warehouse/invoices/operator — invoices issued across all of the operator's warehouses
+  @Get('invoices/operator')
+  @UseGuards(JwtAuthGuard)
+  getOperatorInvoices(@CurrentUser('id') userId: string) {
+    return this.warehouseService.getOperatorInvoices(userId);
+  }
+
+  // GET /warehouse/invoices/:id — invoice detail + a fresh signed PDF download URL
+  @Get('invoices/:id')
+  @UseGuards(JwtAuthGuard)
+  getInvoice(@Param('id') id: string, @CurrentUser('id') userId: string, @CurrentUser('role') userRole: string) {
+    return this.warehouseService.getInvoice(userId, userRole, id);
+  }
+
+  // PATCH /warehouse/invoices/:id/confirm-payment — manual payment confirmation
+  // (operator or admin/moderator — see InvoiceStatus schema comment)
+  @Patch('invoices/:id/confirm-payment')
+  @UseGuards(JwtAuthGuard)
+  confirmInvoicePayment(
+    @Param('id') id: string,
+    @CurrentUser('id') userId: string,
+    @CurrentUser('role') userRole: string,
+    @Body('paymentReference') paymentReference?: string,
+  ) {
+    return this.warehouseService.confirmInvoicePayment(userId, userRole, id, paymentReference);
+  }
+
+  // ─── GOODS RECEIPT NOTE (issued automatically by issueReceipt above) ───────
+
+  // GET /warehouse/grn/:id — GRN detail + a fresh signed PDF download URL
+  @Get('grn/:id')
+  @UseGuards(JwtAuthGuard)
+  getGrn(@Param('id') id: string, @CurrentUser('id') userId: string, @CurrentUser('role') userRole: string) {
+    return this.warehouseService.getGrn(userId, userRole, id);
+  }
+
+  // ─── GATE OUT PASS (NEW_Changes item 10) ────────────────────────────────────
+
+  // POST /warehouse/bookings/:bookingId/gate-out-request — operator requests release
+  @Post('bookings/:bookingId/gate-out-request')
+  @UseGuards(JwtAuthGuard)
+  requestGateOut(
+    @Param('bookingId') bookingId: string,
+    @CurrentUser('id') userId: string,
+    @Body('quantityTons') quantityTons?: number,
+    @Body('requestNote') requestNote?: string,
+  ) {
+    return this.warehouseService.requestGateOut(userId, bookingId, quantityTons, requestNote);
+  }
+
+  // GET /warehouse/gate-out/my — depositor's own gate-out requests (must precede :id)
+  @Get('gate-out/my')
+  @UseGuards(JwtAuthGuard)
+  getMyGateOutPasses(@CurrentUser('id') userId: string) {
+    return this.warehouseService.getMyGateOutPasses(userId);
+  }
+
+  // GET /warehouse/gate-out/operator — requests across all of the operator's warehouses
+  @Get('gate-out/operator')
+  @UseGuards(JwtAuthGuard)
+  getOperatorGateOutPasses(@CurrentUser('id') userId: string) {
+    return this.warehouseService.getOperatorGateOutPasses(userId);
+  }
+
+  // GET /warehouse/gate-out/:id — gate-out request/pass detail
+  @Get('gate-out/:id')
+  @UseGuards(JwtAuthGuard)
+  getGateOutPass(@Param('id') id: string, @CurrentUser('id') userId: string, @CurrentUser('role') userRole: string) {
+    return this.warehouseService.getGateOutPass(userId, userRole, id);
+  }
+
+  // PATCH /warehouse/gate-out/:id/approve — depositor or admin/moderator approves
+  @Patch('gate-out/:id/approve')
+  @UseGuards(JwtAuthGuard)
+  approveGateOut(@Param('id') id: string, @CurrentUser('id') userId: string, @CurrentUser('role') userRole: string) {
+    return this.warehouseService.approveGateOut(userId, userRole, id);
+  }
+
+  // PATCH /warehouse/gate-out/:id/reject — depositor or admin/moderator rejects
+  @Patch('gate-out/:id/reject')
+  @UseGuards(JwtAuthGuard)
+  rejectGateOut(
+    @Param('id') id: string,
+    @CurrentUser('id') userId: string,
+    @CurrentUser('role') userRole: string,
+    @Body('rejectionNote') rejectionNote?: string,
+  ) {
+    return this.warehouseService.rejectGateOut(userId, userRole, id, rejectionNote);
+  }
+
   // POST /warehouse/lien/apply — apply for bank lien
   @Post('lien/apply')
   @UseGuards(JwtAuthGuard)
@@ -144,11 +271,15 @@ export class WarehouseController {
     return this.warehouseService.buyInsurance(userId, dto);
   }
 
-  // GET /warehouse/dashboard/operator — warehouse operator dashboard
+  // GET /warehouse/dashboard/operator — warehouse operator dashboard.
+  // Optional ?warehouseId= to view a specific one (NEW_Changes item 10 —
+  // operators can now run more than one warehouse); defaults to their
+  // first-registered warehouse when omitted, unchanged for single-warehouse
+  // operators.
   @Get('dashboard/operator')
   @UseGuards(JwtAuthGuard)
-  getOperatorDashboard(@CurrentUser('id') userId: string) {
-    return this.warehouseService.getWarehouseDashboard(userId);
+  getOperatorDashboard(@CurrentUser('id') userId: string, @Query('warehouseId') warehouseId?: string) {
+    return this.warehouseService.getWarehouseDashboard(userId, warehouseId);
   }
 
   // ─── ADMIN ────────────────────────────────────────────────────────────────

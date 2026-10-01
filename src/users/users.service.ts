@@ -122,7 +122,7 @@ export class UsersService {
         kycInfoRequestNote: true, kycInfoRequestedAt: true,
         createdAt: true, updatedAt: true,
         profile: true,
-        warehouseProfile: true,
+        warehouseProfiles: true,
         testingAgencyProfile: true,
         transportProfile: true,
         kycDocuments: {
@@ -182,16 +182,37 @@ export class UsersService {
   // Admin: approve / reject KYC. "Request more info" is handled separately
   // by ReviewService.requestClarification (see UsersController.adminKyc) —
   // this method only ever receives APPROVED or REJECTED now.
+  // Approving/rejecting the account is the actual decision point — the
+  // individual KycDocument rows were otherwise left at their upload-time
+  // "pending" status forever, so "My Portal → Documents" kept showing
+  // "Pending Review" on every document even long after the account (and
+  // implicitly its documents) had been approved. Sync them here so the
+  // per-document status reflects the outcome the admin actually decided.
   async adminUpdateKyc(userId: string, status: 'APPROVED' | 'REJECTED', note?: string) {
-    return this.prisma.user.update({
-      where: { id: userId },
-      data: {
-        kycStatus: status,
-        kycApprovedAt: status === 'APPROVED' ? new Date() : null,
-        kycRejectedAt: status === 'REJECTED' ? new Date() : null,
-        kycRejectionNote: status === 'REJECTED' ? note : null,
-      },
-    });
+    const documentStatus = status === 'APPROVED' ? 'approved' : 'rejected';
+    const now = new Date();
+
+    const [user] = await this.prisma.$transaction([
+      this.prisma.user.update({
+        where: { id: userId },
+        data: {
+          kycStatus: status,
+          kycApprovedAt: status === 'APPROVED' ? now : null,
+          kycRejectedAt: status === 'REJECTED' ? now : null,
+          kycRejectionNote: status === 'REJECTED' ? note : null,
+        },
+      }),
+      this.prisma.kycDocument.updateMany({
+        where: { userId, status: 'pending' },
+        data: {
+          status: documentStatus,
+          reviewedAt: now,
+          ...(status === 'REJECTED' && note ? { reviewNote: note } : {}),
+        },
+      }),
+    ]);
+
+    return user;
   }
 
   // Admin: suspend / activate user

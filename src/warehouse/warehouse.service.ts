@@ -2,12 +2,15 @@ import {
   Injectable, NotFoundException, BadRequestException, ForbiddenException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { StorageService } from '../common/storage/storage.service';
 import { ReceiptStatus, LienStatus, TransactionType, BookingStatus } from '@prisma/client';
 import {
-  IsString, IsNumber, IsOptional, IsBoolean, IsDateString, IsArray, Min,
+  IsString, IsNumber, IsOptional, IsBoolean, IsDateString, IsArray, IsObject, Min,
 } from 'class-validator';
 import { v4 as uuidv4 } from 'uuid';
-import { withBookingReference, withBookingReferences } from '../common/utils/booking-reference.util';
+import { withBookingReference, withBookingReferences, formatBookingReference } from '../common/utils/booking-reference.util';
+import { formatDocumentNumber } from '../common/utils/document-number.util';
+import { renderPdfDocument, PdfLineItem } from '../common/pdf/pdf.util';
 
 // Booking statuses that reserve warehouse capacity — a REQUESTED booking
 // isn't confirmed yet, but the tonnage is held so two buyers can't be
@@ -49,12 +52,43 @@ export class CreateWarehouseDto {
   @IsOptional() @IsString() gpsCoordinates?: string;
   @IsNumber() @Min(1) totalCapacityTons: number;
   @IsNumber() @Min(0) pricePerTonMonth: number;
+  // Optional per-commodity rate overrides — see schema comment on
+  // WarehouseProfile.ratesByCommodity for the shape and fallback rule.
+  @IsOptional() @IsObject() ratesByCommodity?: Record<string, number>;
+  @IsOptional() @IsNumber() @Min(0) insurancePricePerTonMonth?: number;
   @IsNumber() @Min(1) minDurationDays: number;
   @IsArray() @IsString({ each: true }) commoditiesAccepted: string[];
   @IsOptional() @IsArray() certifications?: string[];
   @IsOptional() @IsArray() features?: string[];
   @IsOptional() @IsArray() bankPartners?: string[];
   @IsOptional() @IsBoolean() insuranceAvailable?: boolean;
+  @IsOptional() @IsString() description?: string;
+}
+
+// Operator editing their own warehouse (NEW_Changes item 10 — there was
+// previously no way to change anything after registration). Everything
+// optional; only fields the operator actually sends get updated. Deliberately
+// excludes isVerified/isActive (admin-only — see adminVerify/adminSetActive)
+// and userId/id (identity, never editable).
+export class UpdateWarehouseDto {
+  @IsOptional() @IsString() name?: string;
+  @IsOptional() @IsString() type?: string;
+  @IsOptional() @IsString() city?: string;
+  @IsOptional() @IsString() province?: string;
+  @IsOptional() @IsString() address?: string;
+  @IsOptional() @IsString() gpsCoordinates?: string;
+  @IsOptional() @IsNumber() @Min(1) totalCapacityTons?: number;
+  @IsOptional() @IsNumber() @Min(0) pricePerTonMonth?: number;
+  @IsOptional() @IsObject() ratesByCommodity?: Record<string, number>;
+  @IsOptional() @IsNumber() @Min(0) insurancePricePerTonMonth?: number;
+  @IsOptional() @IsNumber() @Min(1) minDurationDays?: number;
+  @IsOptional() @IsArray() @IsString({ each: true }) commoditiesAccepted?: string[];
+  @IsOptional() @IsArray() certifications?: string[];
+  @IsOptional() @IsArray() features?: string[];
+  @IsOptional() @IsArray() bankPartners?: string[];
+  @IsOptional() @IsBoolean() insuranceAvailable?: boolean;
+  @IsOptional() @IsString() managerName?: string;
+  @IsOptional() @IsString() managerPhone?: string;
   @IsOptional() @IsString() description?: string;
 }
 
@@ -110,7 +144,7 @@ export class CancelBookingDto {
 // ─── SERVICE ─────────────────────────────────────────────────────────────────
 @Injectable()
 export class WarehouseService {
-  constructor(private prisma: PrismaService) {}
+  constructor(private prisma: PrismaService, private storage: StorageService) {}
 
   // ─── BROWSE WAREHOUSES ────────────────────────────────────────────────────
   async findAll(query: WarehouseQueryDto) {
@@ -186,13 +220,69 @@ export class WarehouseService {
   }
 
   // ─── REGISTER WAREHOUSE ───────────────────────────────────────────────────
+  // NEW_Changes item 10: operators can now register more than one
+  // warehouse (e.g. facilities in different cities) — this used to reject
+  // a second registration outright.
   async create(userId: string, dto: CreateWarehouseDto) {
-    const existing = await this.prisma.warehouseProfile.findUnique({ where: { userId } });
-    if (existing) throw new BadRequestException('You already have a warehouse profile');
-
     return this.prisma.warehouseProfile.create({
       data: { userId, ...dto } as any,
     });
+  }
+
+  // ─── EDIT WAREHOUSE (operator, own warehouse only) ─────────────────────────
+  // NEW_Changes item 10: there was previously no way to change anything
+  // after registration — rates, capacity, even a typo in the address were
+  // permanent. isVerified/isActive stay admin-only (see adminVerify /
+  // adminSetActive) since those are trust/moderation signals, not the
+  // operator's own listing content.
+  async update(operatorId: string, warehouseId: string, dto: UpdateWarehouseDto) {
+    const warehouse = await this.prisma.warehouseProfile.findUnique({ where: { id: warehouseId } });
+    if (!warehouse) throw new NotFoundException('Warehouse not found');
+    if (warehouse.userId !== operatorId) throw new ForbiddenException('Not your warehouse');
+
+    return this.prisma.warehouseProfile.update({
+      where: { id: warehouseId },
+      data: { ...dto } as any,
+    });
+  }
+
+  // Resolves the effective rate for a commodity: a per-commodity override
+  // if the operator set one, else the warehouse's flat base rate. Shared
+  // by bookStorage() (actual charge) and quoteRate() (frontend preview
+  // before the depositor submits a booking).
+  private resolveRatePerTonMonth(warehouse: { pricePerTonMonth: any; ratesByCommodity: any }, commodity: string): number {
+    const overrides = (warehouse.ratesByCommodity || {}) as Record<string, number>;
+    const override = overrides[commodity];
+    return override !== undefined && override !== null ? Number(override) : Number(warehouse.pricePerTonMonth);
+  }
+
+  // ─── RATE QUOTE (no booking created — lets the frontend show a live
+  // price, including insurance, before the depositor commits) ────────────────
+  async quoteRate(warehouseId: string, commodity: string, quantityTons: number, durationDays: number, includeInsurance?: boolean) {
+    const warehouse = await this.prisma.warehouseProfile.findUnique({ where: { id: warehouseId } });
+    if (!warehouse) throw new NotFoundException('Warehouse not found');
+
+    const monthsDecimal = durationDays / 30;
+    const ratePerTonMonth = this.resolveRatePerTonMonth(warehouse, commodity);
+    const storageCost = quantityTons * ratePerTonMonth * monthsDecimal;
+
+    let insuranceCost = 0;
+    let insuranceAvailable = false;
+    if (includeInsurance) {
+      if (warehouse.insuranceAvailable && warehouse.insurancePricePerTonMonth != null) {
+        insuranceAvailable = true;
+        insuranceCost = quantityTons * Number(warehouse.insurancePricePerTonMonth) * monthsDecimal;
+      }
+    }
+
+    return {
+      ratePerTonMonth,
+      storageCost,
+      insuranceAvailable: warehouse.insuranceAvailable && warehouse.insurancePricePerTonMonth != null,
+      insurancePricePerTonMonth: warehouse.insurancePricePerTonMonth,
+      insuranceCost,
+      totalCost: storageCost + insuranceCost,
+    };
   }
 
   // ─── BOOK STORAGE ─────────────────────────────────────────────────────────
@@ -229,7 +319,22 @@ export class WarehouseService {
     exitDate.setDate(exitDate.getDate() + dto.durationDays);
 
     const monthsDecimal = dto.durationDays / 30;
-    const totalCost = dto.quantityTons * Number(warehouse.pricePerTonMonth) * monthsDecimal;
+    const ratePerTonMonth = this.resolveRatePerTonMonth(warehouse, dto.commodity);
+    const storageCost = dto.quantityTons * ratePerTonMonth * monthsDecimal;
+
+    // Insurance must actually be priced before it can be selected — a
+    // checkbox with no rate behind it was exactly the bug reported
+    // ("no price is either visible for warehouse provider or the
+    // customer"). Refusing here is better than silently charging Rs. 0
+    // for coverage that doesn't really exist.
+    let insuranceCost = 0;
+    if (dto.includeInsurance) {
+      if (!warehouse.insuranceAvailable || warehouse.insurancePricePerTonMonth == null) {
+        throw new BadRequestException('This warehouse has not set an insurance rate yet, so insurance cannot be added to this booking.');
+      }
+      insuranceCost = dto.quantityTons * Number(warehouse.insurancePricePerTonMonth) * monthsDecimal;
+    }
+    const totalCost = storageCost + insuranceCost;
 
     const booking = await this.prisma.storageBooking.create({
       data: {
@@ -242,7 +347,8 @@ export class WarehouseService {
         entryDate,
         durationDays: dto.durationDays,
         exitDate,
-        pricePerTon: warehouse.pricePerTonMonth,
+        pricePerTon: ratePerTonMonth,
+        insuranceCost: dto.includeInsurance ? insuranceCost : null,
         totalCost,
         includeInsurance: dto.includeInsurance || false,
         notes: dto.notes,
@@ -284,6 +390,9 @@ export class WarehouseService {
       include: {
         warehouse: { select: { name: true, city: true, province: true, managerPhone: true } },
         receipt: { select: { id: true, receiptNumber: true, status: true } },
+        invoice: { select: { id: true, invoiceNumber: true, status: true, totalAmount: true } },
+        goodsReceiptNote: { select: { id: true, grnNumber: true } },
+        gateOutPasses: { orderBy: { createdAt: 'desc' }, take: 1 },
       },
       orderBy: { createdAt: 'desc' },
     });
@@ -448,7 +557,309 @@ export class WarehouseService {
       data: { status: BookingStatus.ACTIVE },
     });
 
+    // NEW_Changes item 10: a formal Goods Receipt Note, issued at exactly
+    // this moment — this IS "when the goods are received" in the system,
+    // so there's no separate manual step for it. Distinct from the
+    // WarehouseReceipt above (that's a collateral/ownership document used
+    // for bank liens and insurance; this is the delivery acknowledgment).
+    await this.issueGoodsReceiptNote(booking, operatorId, actualQuantityTons, qualityMetrics);
+
     return receipt;
+  }
+
+  private async issueGoodsReceiptNote(
+    booking: { id: string; warehouseId: string; depositorId: string; commodity: string; variety: string | null },
+    operatorId: string,
+    quantityTons: number,
+    qualityMetrics: any,
+  ) {
+    const [warehouse, depositor] = await Promise.all([
+      this.prisma.warehouseProfile.findUnique({ where: { id: booking.warehouseId } }),
+      this.prisma.user.findUnique({ where: { id: booking.depositorId }, select: { profile: { select: { fullName: true } } } }),
+    ]);
+
+    const qualityNotes = qualityMetrics == null ? null
+      : typeof qualityMetrics === 'string' ? qualityMetrics
+      : JSON.stringify(qualityMetrics);
+
+    // Reserve the seq first (a throwaway create+read would work too, but
+    // this way the PDF can embed the real grnNumber from the start).
+    const seqHolder = await this.prisma.goodsReceiptNote.create({
+      data: {
+        grnNumber: 'PENDING',
+        bookingId: booking.id,
+        warehouseId: booking.warehouseId,
+        depositorId: booking.depositorId,
+        commodity: booking.commodity,
+        variety: booking.variety,
+        quantityTons,
+        qualityNotes,
+        receivedById: operatorId,
+        s3Key: '',
+      },
+    });
+    const grnNumber = formatDocumentNumber('GRN', seqHolder.grnSeq, seqHolder.receivedAt);
+
+    const pdfBuffer = await renderPdfDocument({
+      documentTitle: 'GOODS RECEIPT NOTE',
+      documentNumber: grnNumber,
+      issuedAt: seqHolder.receivedAt,
+      fromLines: [warehouse?.name || 'Warehouse', warehouse?.address || '', `${warehouse?.city || ''}, ${warehouse?.province || ''}`],
+      toLines: [depositor?.profile?.fullName || 'Depositor'],
+      meta: [
+        ['Commodity', booking.variety ? `${booking.commodity} (${booking.variety})` : booking.commodity],
+        ['Quantity Received', `${quantityTons} tons`],
+        ...(qualityNotes ? [['Quality Notes', qualityNotes] as [string, string]] : []),
+      ],
+      lineItems: [{ label: 'Goods received and accepted into storage in good order, subject to the quality notes above (if any).' }],
+      footerNote: 'This note confirms physical receipt of goods only. It is not a warehouse receipt / collateral document — see your Digital Warehouse Receipt for that.',
+    });
+
+    const s3Key = `warehouse-documents/grn-${seqHolder.id}.pdf`;
+    await this.storage.putObject(s3Key, pdfBuffer, 'application/pdf');
+
+    return this.prisma.goodsReceiptNote.update({
+      where: { id: seqHolder.id },
+      data: { grnNumber, s3Key },
+    });
+  }
+
+  // ─── INVOICE (warehouse operator generates & "sends" to the depositor) ─────
+  // NEW_Changes item 10. One invoice per booking (see schema comment on
+  // WarehouseInvoice.bookingId) — amounts are copied from the booking's
+  // already-computed totalCost/insuranceCost rather than recalculated, so
+  // the invoice can't drift from what bookStorage() actually charged.
+  async generateInvoice(operatorId: string, bookingId: string) {
+    const booking = await this.prisma.storageBooking.findUnique({
+      where: { id: bookingId },
+      include: { warehouse: true, invoice: true },
+    });
+    if (!booking) throw new NotFoundException('Booking not found');
+    if (booking.warehouse.userId !== operatorId) throw new ForbiddenException('Not your warehouse');
+    if (booking.invoice) throw new BadRequestException('An invoice has already been generated for this booking');
+
+    const [depositor] = await Promise.all([
+      this.prisma.user.findUnique({ where: { id: booking.depositorId }, select: { profile: { select: { fullName: true, address: true, city: true } } } }),
+    ]);
+
+    const storageCost = Number(booking.totalCost) - Number(booking.insuranceCost || 0);
+
+    const seqHolder = await this.prisma.warehouseInvoice.create({
+      data: {
+        invoiceNumber: 'PENDING',
+        bookingId: booking.id,
+        warehouseId: booking.warehouseId,
+        depositorId: booking.depositorId,
+        storageCost,
+        insuranceCost: booking.insuranceCost,
+        totalAmount: booking.totalCost,
+        s3Key: '',
+      },
+    });
+    const invoiceNumber = formatDocumentNumber('INV', seqHolder.invoiceSeq, seqHolder.issuedAt);
+
+    const lineItems: PdfLineItem[] = [
+      { label: `Storage — ${booking.commodity}${booking.variety ? ` (${booking.variety})` : ''}, ${booking.quantityTons} tons × ${booking.durationDays} days`, amount: storageCost },
+    ];
+    if (booking.insuranceCost) lineItems.push({ label: 'Storage insurance', amount: Number(booking.insuranceCost) });
+
+    const pdfBuffer = await renderPdfDocument({
+      documentTitle: 'STORAGE INVOICE',
+      documentNumber: invoiceNumber,
+      issuedAt: seqHolder.issuedAt,
+      fromLines: [booking.warehouse.name, booking.warehouse.address, `${booking.warehouse.city}, ${booking.warehouse.province}`],
+      toLines: [depositor?.profile?.fullName || 'Depositor', depositor?.profile?.address || '', depositor?.profile?.city || ''],
+      meta: [['Booking', formatBookingReference((booking as any).bookingSeq, booking.createdAt) || booking.id]],
+      lineItems,
+      totalLabel: 'TOTAL DUE',
+      totalAmount: Number(booking.totalCost),
+      footerNote: 'Payment confirmation will be recorded by the warehouse once received. This is not a receipt of payment.',
+    });
+
+    const s3Key = `warehouse-documents/invoice-${seqHolder.id}.pdf`;
+    await this.storage.putObject(s3Key, pdfBuffer, 'application/pdf');
+
+    return this.prisma.warehouseInvoice.update({
+      where: { id: seqHolder.id },
+      data: { invoiceNumber, s3Key },
+    });
+  }
+
+  // Manual payment confirmation — see InvoiceStatus schema comment for why
+  // there's no gateway callback here. Operator (of that warehouse) or any
+  // admin/moderator can confirm.
+  async confirmInvoicePayment(userId: string, userRole: string, invoiceId: string, paymentReference?: string) {
+    const invoice = await this.prisma.warehouseInvoice.findUnique({ where: { id: invoiceId }, include: { warehouse: true } });
+    if (!invoice) throw new NotFoundException('Invoice not found');
+    const isAdmin = userRole === 'ADMIN' || userRole === 'MODERATOR';
+    if (invoice.warehouse.userId !== userId && !isAdmin) throw new ForbiddenException('Not authorized to confirm this payment');
+    if (invoice.status === 'PAID') throw new BadRequestException('This invoice is already marked as paid');
+
+    return this.prisma.warehouseInvoice.update({
+      where: { id: invoiceId },
+      data: { status: 'PAID', paidAt: new Date(), paymentReference, confirmedById: userId },
+    });
+  }
+
+  async getInvoice(userId: string, userRole: string, invoiceId: string) {
+    const invoice = await this.prisma.warehouseInvoice.findUnique({
+      where: { id: invoiceId },
+      include: { warehouse: { select: { name: true, city: true, userId: true } }, booking: true },
+    });
+    if (!invoice) throw new NotFoundException('Invoice not found');
+    const isAdmin = userRole === 'ADMIN' || userRole === 'MODERATOR';
+    if (invoice.depositorId !== userId && invoice.warehouse.userId !== userId && !isAdmin) {
+      throw new ForbiddenException('Access denied');
+    }
+    return { ...invoice, downloadUrl: await this.storage.getPresignedUrl(invoice.s3Key, 600) };
+  }
+
+  async getMyInvoices(depositorId: string) {
+    return this.prisma.warehouseInvoice.findMany({
+      where: { depositorId },
+      include: { warehouse: { select: { name: true, city: true } } },
+      orderBy: { issuedAt: 'desc' },
+    });
+  }
+
+  async getOperatorInvoices(operatorId: string) {
+    const warehouses = await this.prisma.warehouseProfile.findMany({ where: { userId: operatorId }, select: { id: true } });
+    return this.prisma.warehouseInvoice.findMany({
+      where: { warehouseId: { in: warehouses.map((w) => w.id) } },
+      include: { depositor: { select: { profile: { select: { fullName: true } } } }, warehouse: { select: { name: true } } },
+      orderBy: { issuedAt: 'desc' },
+    });
+  }
+
+  // ─── GOODS RECEIPT NOTE (read access — issued automatically by
+  // issueReceipt() above) ─────────────────────────────────────────────────────
+  async getGrn(userId: string, userRole: string, grnId: string) {
+    const grn = await this.prisma.goodsReceiptNote.findUnique({
+      where: { id: grnId },
+      include: { warehouse: { select: { name: true, city: true, userId: true } } },
+    });
+    if (!grn) throw new NotFoundException('Goods Receipt Note not found');
+    const isAdmin = userRole === 'ADMIN' || userRole === 'MODERATOR';
+    if (grn.depositorId !== userId && grn.warehouse.userId !== userId && !isAdmin) {
+      throw new ForbiddenException('Access denied');
+    }
+    return { ...grn, downloadUrl: await this.storage.getPresignedUrl(grn.s3Key, 600) };
+  }
+
+  // ─── GATE OUT PASS ──────────────────────────────────────────────────────────
+  // NEW_Changes item 10: the warehouse operator requests release of goods,
+  // then either the depositor (goods owner) or an admin/moderator must
+  // approve before the pass is actually issued.
+  async requestGateOut(operatorId: string, bookingId: string, quantityTons?: number, requestNote?: string) {
+    const booking = await this.prisma.storageBooking.findUnique({ where: { id: bookingId }, include: { warehouse: true } });
+    if (!booking) throw new NotFoundException('Booking not found');
+    if (booking.warehouse.userId !== operatorId) throw new ForbiddenException('Not your warehouse');
+    if (booking.status !== BookingStatus.ACTIVE) {
+      throw new BadRequestException(`Goods must be in active storage before a gate-out pass can be requested (current status: ${booking.status}).`);
+    }
+    const existingPending = await this.prisma.gateOutPass.findFirst({ where: { bookingId, status: 'PENDING' } });
+    if (existingPending) throw new BadRequestException('There is already a pending gate-out request for this booking');
+
+    return this.prisma.gateOutPass.create({
+      data: {
+        bookingId,
+        warehouseId: booking.warehouseId,
+        depositorId: booking.depositorId,
+        quantityTons: quantityTons ?? booking.quantityTons,
+        requestedById: operatorId,
+        requestNote,
+      },
+    });
+  }
+
+  async approveGateOut(userId: string, userRole: string, passId: string) {
+    const pass = await this.prisma.gateOutPass.findUnique({ where: { id: passId }, include: { warehouse: true, booking: true } });
+    if (!pass) throw new NotFoundException('Gate-out request not found');
+    const isAdmin = userRole === 'ADMIN' || userRole === 'MODERATOR';
+    const isDepositor = pass.depositorId === userId;
+    if (!isAdmin && !isDepositor) throw new ForbiddenException('Only the depositor or an admin can approve a gate-out request');
+    if (pass.status !== 'PENDING') throw new BadRequestException(`This request has already been ${pass.status.toLowerCase()}`);
+
+    const approvedAt = new Date();
+    const passNumber = formatDocumentNumber('GOP', pass.passSeq, approvedAt);
+
+    const [depositor] = await Promise.all([
+      this.prisma.user.findUnique({ where: { id: pass.depositorId }, select: { profile: { select: { fullName: true } } } }),
+    ]);
+
+    const pdfBuffer = await renderPdfDocument({
+      documentTitle: 'GATE OUT PASS',
+      documentNumber: passNumber,
+      issuedAt: approvedAt,
+      fromLines: [pass.warehouse.name, pass.warehouse.address, `${pass.warehouse.city}, ${pass.warehouse.province}`],
+      toLines: [depositor?.profile?.fullName || 'Depositor'],
+      meta: [
+        ['Commodity', pass.booking.variety ? `${pass.booking.commodity} (${pass.booking.variety})` : pass.booking.commodity],
+        ['Quantity Authorized', `${pass.quantityTons} tons`],
+        ['Approved By', isAdmin ? 'AgriConnect Admin' : 'Depositor (goods owner)'],
+      ],
+      lineItems: [{ label: 'This pass authorizes the bearer to remove the above quantity of goods from the warehouse.' }],
+      footerNote: 'Present this pass, along with valid ID, to warehouse security to collect the goods.',
+    });
+
+    const s3Key = `warehouse-documents/gate-pass-${pass.id}.pdf`;
+    await this.storage.putObject(s3Key, pdfBuffer, 'application/pdf');
+
+    return this.prisma.gateOutPass.update({
+      where: { id: passId },
+      data: {
+        status: 'APPROVED',
+        approvedById: userId,
+        approverRole: isAdmin ? 'ADMIN' : 'DEPOSITOR',
+        approvedAt,
+        passNumber,
+        s3Key,
+      },
+    });
+  }
+
+  async rejectGateOut(userId: string, userRole: string, passId: string, rejectionNote?: string) {
+    const pass = await this.prisma.gateOutPass.findUnique({ where: { id: passId } });
+    if (!pass) throw new NotFoundException('Gate-out request not found');
+    const isAdmin = userRole === 'ADMIN' || userRole === 'MODERATOR';
+    const isDepositor = pass.depositorId === userId;
+    if (!isAdmin && !isDepositor) throw new ForbiddenException('Only the depositor or an admin can reject a gate-out request');
+    if (pass.status !== 'PENDING') throw new BadRequestException(`This request has already been ${pass.status.toLowerCase()}`);
+
+    return this.prisma.gateOutPass.update({
+      where: { id: passId },
+      data: { status: 'REJECTED', approvedById: userId, approverRole: isAdmin ? 'ADMIN' : 'DEPOSITOR', approvedAt: new Date(), rejectionNote },
+    });
+  }
+
+  async getGateOutPass(userId: string, userRole: string, passId: string) {
+    const pass = await this.prisma.gateOutPass.findUnique({
+      where: { id: passId },
+      include: { warehouse: { select: { name: true, city: true, userId: true } }, booking: true },
+    });
+    if (!pass) throw new NotFoundException('Gate-out request not found');
+    const isAdmin = userRole === 'ADMIN' || userRole === 'MODERATOR';
+    if (pass.depositorId !== userId && pass.warehouse.userId !== userId && !isAdmin) {
+      throw new ForbiddenException('Access denied');
+    }
+    return { ...pass, downloadUrl: pass.s3Key ? await this.storage.getPresignedUrl(pass.s3Key, 600) : null };
+  }
+
+  async getMyGateOutPasses(depositorId: string) {
+    return this.prisma.gateOutPass.findMany({
+      where: { depositorId },
+      include: { warehouse: { select: { name: true, city: true } } },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  async getOperatorGateOutPasses(operatorId: string) {
+    const warehouses = await this.prisma.warehouseProfile.findMany({ where: { userId: operatorId }, select: { id: true } });
+    return this.prisma.gateOutPass.findMany({
+      where: { warehouseId: { in: warehouses.map((w) => w.id) } },
+      include: { depositor: { select: { profile: { select: { fullName: true } } } } },
+      orderBy: { createdAt: 'desc' },
+    });
   }
 
   // ─── MY RECEIPTS ──────────────────────────────────────────────────────────
@@ -619,17 +1030,49 @@ export class WarehouseService {
   }
 
   // ─── WAREHOUSE DASHBOARD (operator) ──────────────────────────────────────
-  async getWarehouseDashboard(operatorId: string) {
-    const warehouse = await this.prisma.warehouseProfile.findUnique({
+  // NEW_Changes item 10: an operator account is no longer capped at one
+  // warehouse (see create() below), so this now also returns the full list
+  // of the operator's warehouses (lightweight, for a picker) alongside the
+  // full stats/bookings detail for whichever one is selected.
+  async getMyWarehouses(operatorId: string) {
+    const warehouses = await this.prisma.warehouseProfile.findMany({
       where: { userId: operatorId },
+      orderBy: { createdAt: 'asc' },
     });
-    if (!warehouse) throw new NotFoundException('No warehouse profile found');
+    if (!warehouses.length) return [];
 
-    const [bookings, receipts, activeReceipts] = await Promise.all([
+    const usage = await this.prisma.storageBooking.groupBy({
+      by: ['warehouseId'],
+      where: { warehouseId: { in: warehouses.map((w) => w.id) }, status: { in: CAPACITY_HELD_STATUSES } },
+      _sum: { quantityTons: true },
+    });
+    const usedByWarehouse = new Map<string, number>(
+      usage.map((u) => [u.warehouseId as string, (u._sum.quantityTons as number) || 0]),
+    );
+    return warehouses.map((w) => ({
+      ...w,
+      availableCapacityTons: w.totalCapacityTons - (usedByWarehouse.get(w.id) || 0),
+    }));
+  }
+
+  async getWarehouseDashboard(operatorId: string, warehouseId?: string) {
+    const warehouse = warehouseId
+      ? await this.prisma.warehouseProfile.findUnique({ where: { id: warehouseId } })
+      : await this.prisma.warehouseProfile.findFirst({ where: { userId: operatorId }, orderBy: { createdAt: 'asc' } });
+    if (!warehouse) throw new NotFoundException('No warehouse profile found');
+    if (warehouse.userId !== operatorId) throw new ForbiddenException('Not your warehouse');
+
+    const [bookings, receipts, activeReceipts, myWarehouses] = await Promise.all([
       this.prisma.storageBooking.findMany({
         where: { warehouseId: warehouse.id },
         include: {
           depositor: { select: { profile: { select: { fullName: true, city: true } } } },
+          // Document state per booking (NEW_Changes item 10) so the
+          // dashboard can show invoice/GRN/gate-pass status inline
+          // without extra round trips.
+          invoice: { select: { id: true, invoiceNumber: true, status: true, totalAmount: true } },
+          goodsReceiptNote: { select: { id: true, grnNumber: true } },
+          gateOutPasses: { orderBy: { createdAt: 'desc' }, take: 1 },
         },
         orderBy: { createdAt: 'desc' },
         take: 10,
@@ -638,6 +1081,7 @@ export class WarehouseService {
       this.prisma.warehouseReceipt.count({
         where: { warehouseId: warehouse.id, status: ReceiptStatus.ACTIVE },
       }),
+      this.getMyWarehouses(operatorId),
     ]);
 
     const usedCapacity = await this.prisma.storageBooking.aggregate({
@@ -651,6 +1095,7 @@ export class WarehouseService {
     });
 
     return {
+      warehouses: myWarehouses,
       warehouse: {
         ...warehouse,
         availableCapacityTons: warehouse.totalCapacityTons - (usedCapacity._sum.quantityTons || 0),

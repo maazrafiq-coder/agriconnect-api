@@ -2,7 +2,17 @@ import { Test } from '@nestjs/testing';
 import { BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { WarehouseService } from './warehouse.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { StorageService } from '../common/storage/storage.service';
 import { ReceiptStatus } from '@prisma/client';
+
+// Stub — none of these tests touch invoice/GRN/gate-pass generation
+// (the only paths that call into StorageService), but WarehouseService's
+// constructor now requires it, so the DI container needs *something*.
+const storageStub = {
+  putObject: jest.fn(),
+  getPresignedUrl: jest.fn(),
+  deleteObject: jest.fn(),
+};
 
 /**
  * Covers WarehouseService.applyLien() — the loan-application path.
@@ -45,7 +55,7 @@ describe('WarehouseService.applyLien', () => {
     };
 
     const moduleRef = await Test.createTestingModule({
-      providers: [WarehouseService, { provide: PrismaService, useValue: prisma }],
+      providers: [WarehouseService, { provide: PrismaService, useValue: prisma }, { provide: StorageService, useValue: storageStub }],
     }).compile();
 
     service = moduleRef.get(WarehouseService);
@@ -137,7 +147,7 @@ describe('WarehouseService.adminVerify', () => {
       },
     };
     const moduleRef = await Test.createTestingModule({
-      providers: [WarehouseService, { provide: PrismaService, useValue: prisma }],
+      providers: [WarehouseService, { provide: PrismaService, useValue: prisma }, { provide: StorageService, useValue: storageStub }],
     }).compile();
     service = moduleRef.get(WarehouseService);
   });

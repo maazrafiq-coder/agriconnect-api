@@ -35,6 +35,19 @@ export class ProductsController {
     return this.productsService.getSavedProducts(userId);
   }
 
+  // DELETE /products/:id — seller deletes their own listing
+  @Delete(':id')
+  @UseGuards(JwtAuthGuard)
+  remove(@Param('id') id: string, @CurrentUser('id') userId: string) {
+    return this.productsService.remove(id, userId);
+  }
+
+  // GET /products/seller/:sellerId — public seller profile + their active listings
+  @Get('seller/:sellerId')
+  getSellerProfile(@Param('sellerId') sellerId: string) {
+    return this.productsService.getSellerPublicProfile(sellerId);
+  }
+
   // GET /products/:id — public detail
   @Get(':id')
   findOne(@Param('id') id: string) {

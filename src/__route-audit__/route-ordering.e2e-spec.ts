@@ -20,6 +20,11 @@
  * attached to the request — this test is only about *routing*, not
  * authorization (that's covered separately in the IDOR/security pass).
  */
+
+process.env.FRONTEND_URL = 'http://localhost:3000';
+process.env.JWT_SECRET = 'test-jwt-secret-123456789012345678901234567890';
+process.env.JWT_REFRESH_SECRET = 'test-refresh-secret-123456789012345678901234567890';
+
 import { Test } from '@nestjs/testing';
 import { INestApplication } from '@nestjs/common';
 import { AppModule } from '../app.module';
@@ -280,7 +285,7 @@ describe('Round 2 / Milestone 1 — live route-ordering audit', () => {
     // but worth a live check now that there are two ':id'-shaped route
     // families under the same 'clarifications' prefix).
     const lookedUpOwnWarehouseProfile = calls.some(
-      (c) => c.model === 'warehouseProfile' && c.method === 'findUnique' && c.args?.where?.userId === 'test-admin-id',
+      (c) => c.model === 'warehouseProfile' && c.method === 'findMany' && c.args?.where?.userId === 'test-admin-id',
     );
     expect(lookedUpOwnWarehouseProfile).toBe(true);
   });

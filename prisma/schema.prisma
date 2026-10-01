@@ -188,6 +188,26 @@ enum LienStatus {
   DEFAULTED
 }
 
+// NEW_Changes item 10 — invoicing/GRN/gate-pass paperwork for a storage
+// booking. Manual payment confirmation only: AgriConnect has no payment
+// gateway integrated anywhere (see StorageBooking/Order — all payments
+// are internal ledger entries), so "payment confirmation" here means the
+// operator/admin marking an invoice paid after receiving payment
+// out-of-band (bank transfer, cash, etc.), with an optional reference note.
+enum InvoiceStatus {
+  UNPAID
+  PAID
+}
+
+// A Gate Out Pass authorizes goods to physically leave the warehouse.
+// Requested by the operator, then approved either by the depositor (the
+// goods' owner) or an admin/moderator — see GateOutPass.approverRole.
+enum GatePassStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
 enum TestingStatus {
   REQUESTED
   ASSIGNED
@@ -323,7 +343,9 @@ model User {
   refreshTokens   RefreshToken[]
 
   // ── Domain profiles (one per role) ───────────────────────────────────────
-  warehouseProfile     WarehouseProfile?
+  // Plural — an operator account can now own more than one warehouse (see
+  // WarehouseProfile.userId comment).
+  warehouseProfiles    WarehouseProfile[]
   testingAgencyProfile TestingAgencyProfile?
   transportProfile     TransportProfile?
 
@@ -336,6 +358,9 @@ model User {
   // ── Storage relations (User as depositor / owner) ─────────────────────────
   storageBookings   StorageBooking[]
   warehouseReceipts WarehouseReceipt[]
+  warehouseInvoices WarehouseInvoice[]
+  goodsReceiptNotes GoodsReceiptNote[]
+  gateOutPasses     GateOutPass[]
 
   // ── Testing / transport as requester ─────────────────────────────────────
   testingRequests   TestingRequest[]  @relation("TestingRequester")
@@ -649,7 +674,11 @@ model Payment {
 
 model WarehouseProfile {
   id                  String        @id @default(uuid())
-  userId              String        @unique
+  // No longer @unique — NEW_Changes item 10: an operator account can run
+  // more than one warehouse (e.g. facilities in different cities). Kept
+  // indexed since "all warehouses for this operator" is now a common
+  // lookup (see WarehouseService.getMyWarehouses).
+  userId              String
   name                String
   type                WarehouseType
   city                String
@@ -658,6 +687,20 @@ model WarehouseProfile {
   gpsCoordinates      String?
   totalCapacityTons   Float
   pricePerTonMonth    Decimal       @db.Decimal(10, 2)
+  // Per-commodity overrides of pricePerTonMonth — e.g. paddy stores
+  // differently (and often cheaper) than milled/parboiled rice, so a
+  // single flat rate for the whole warehouse wasn't realistic. Shape:
+  // { "Basmati Paddy": "180.00", "Parboiled Rice": "220.00" }. A commodity
+  // this warehouse accepts but has no entry for here just falls back to
+  // pricePerTonMonth (see resolveRatePerTonMonth() in warehouse.service.ts).
+  ratesByCommodity    Json?
+  // Rate for the booking-time "include insurance" option (per ton per
+  // month, same unit as pricePerTonMonth). Null/unset means the operator
+  // hasn't priced insurance yet, so bookStorage() refuses
+  // includeInsurance requests rather than silently charging nothing for
+  // it — this is intentionally separate from StorageInsurance, which is a
+  // different, post-receipt third-party policy an owner buys later.
+  insurancePricePerTonMonth Decimal? @db.Decimal(10, 2)
   minDurationDays     Int
   commoditiesAccepted String[]
   certifications      String[]
@@ -681,9 +724,13 @@ model WarehouseProfile {
   // All bookings and receipts at this warehouse
   bookings            StorageBooking[]
   receipts            WarehouseReceipt[]
+  invoices            WarehouseInvoice[]
+  goodsReceiptNotes   GoodsReceiptNote[]
+  gateOutPasses       GateOutPass[]
 
   @@index([province])
   @@index([type])
+  @@index([userId])
   @@map("warehouse_profiles")
 }
 
@@ -706,6 +753,10 @@ model StorageBooking {
   durationDays     Int
   exitDate         DateTime
   pricePerTon      Decimal  @db.Decimal(10, 2)
+  // Itemized so both sides can see what they paid for insurance
+  // specifically, instead of it being invisibly folded into totalCost —
+  // see WarehouseProfile.insurancePricePerTonMonth.
+  insuranceCost    Decimal? @db.Decimal(12, 2)
   totalCost        Decimal  @db.Decimal(14, 2)
   status           BookingStatus @default(REQUESTED)
   // Set when the warehouse operator rejects a REQUESTED booking.
@@ -724,6 +775,9 @@ model StorageBooking {
   warehouse        WarehouseProfile @relation(fields: [warehouseId], references: [id])
   depositor        User             @relation(fields: [depositorId], references: [id])
   receipt          WarehouseReceipt?
+  invoice          WarehouseInvoice?
+  goodsReceiptNote GoodsReceiptNote?
+  gateOutPasses    GateOutPass[]
 
   @@index([warehouseId])
   @@index([depositorId])
@@ -799,6 +853,109 @@ model StorageInsurance {
   receipt        WarehouseReceipt @relation(fields: [receiptId], references: [id])
 
   @@map("storage_insurance")
+}
+
+// NEW_Changes item 10 — storage invoice for a booking. One per booking
+// (bookingId is unique): storage rate structure already gives one clean
+// total per booking, so there's no reason to support multiple invoices
+// against the same booking. amounts are copied from the booking at
+// generation time rather than re-read live, so the invoice stays accurate
+// even if the operator edits their rates afterward.
+model WarehouseInvoice {
+  id               String        @id @default(uuid())
+  invoiceNumber    String        @unique
+  // Race-safe uniqueness the same way StorageBooking.bookingSeq works —
+  // see booking-reference.util.ts's comment for why a native Postgres
+  // autoincrement beats a COUNT-based scheme under concurrency.
+  invoiceSeq       Int           @unique @default(autoincrement())
+  bookingId        String        @unique
+  warehouseId      String
+  depositorId      String
+  storageCost      Decimal       @db.Decimal(14, 2)
+  insuranceCost    Decimal?      @db.Decimal(12, 2)
+  totalAmount      Decimal       @db.Decimal(14, 2)
+  status           InvoiceStatus @default(UNPAID)
+  // Manual payment confirmation (no payment gateway integrated — see
+  // InvoiceStatus comment) — a free-text reference the operator/admin
+  // enters when marking this paid (bank transfer ref, cheque no., etc.).
+  paymentReference String?
+  paidAt           DateTime?
+  confirmedById    String?       // operator or admin who confirmed payment
+  s3Key            String        // generated PDF, in the same bucket as other uploads
+  issuedAt         DateTime      @default(now())
+  createdAt        DateTime      @default(now())
+
+  booking          StorageBooking   @relation(fields: [bookingId], references: [id])
+  warehouse        WarehouseProfile @relation(fields: [warehouseId], references: [id])
+  depositor        User             @relation(fields: [depositorId], references: [id])
+
+  @@index([warehouseId])
+  @@index([depositorId])
+  @@map("warehouse_invoices")
+}
+
+// Issued once the physical goods actually arrive at the warehouse — a
+// separate, formal "goods received" acknowledgment distinct from the
+// WarehouseReceipt (which is a collateral/ownership document used for bank
+// liens and insurance, and may be issued at a different moment in the
+// operator's workflow).
+model GoodsReceiptNote {
+  id           String   @id @default(uuid())
+  grnNumber    String   @unique
+  grnSeq       Int      @unique @default(autoincrement())
+  bookingId    String   @unique
+  warehouseId  String
+  depositorId  String
+  commodity    String
+  variety      String?
+  quantityTons Float
+  qualityNotes String?
+  receivedAt   DateTime @default(now())
+  receivedById String   // operator user id who confirmed physical receipt
+  s3Key        String
+  createdAt    DateTime @default(now())
+
+  booking      StorageBooking   @relation(fields: [bookingId], references: [id])
+  warehouse    WarehouseProfile @relation(fields: [warehouseId], references: [id])
+  depositor    User             @relation(fields: [depositorId], references: [id])
+
+  @@index([warehouseId])
+  @@map("goods_receipt_notes")
+}
+
+// Authorizes goods to physically leave the warehouse. A booking can have
+// more than one (a rejected/re-requested pass shouldn't block a fresh
+// attempt), so this isn't unique on bookingId the way Invoice/GRN are.
+model GateOutPass {
+  id            String         @id @default(uuid())
+  // Only set once APPROVED — a PENDING/REJECTED request was never
+  // actually issued, so it doesn't get a pass number.
+  passNumber    String?        @unique
+  passSeq       Int            @unique @default(autoincrement())
+  bookingId     String
+  warehouseId   String
+  depositorId   String
+  quantityTons  Float
+  requestedById String         // warehouse operator who prepared the request
+  requestNote   String?
+  status        GatePassStatus @default(PENDING)
+  approvedById  String?
+  // 'DEPOSITOR' | 'ADMIN' — see GatePassStatus comment on the schema enum
+  // above for why both can authorize release.
+  approverRole  String?
+  approvedAt    DateTime?
+  rejectionNote String?
+  s3Key         String?        // only present once APPROVED and the pass PDF is generated
+  createdAt     DateTime       @default(now())
+
+  booking       StorageBooking   @relation(fields: [bookingId], references: [id])
+  warehouse     WarehouseProfile @relation(fields: [warehouseId], references: [id])
+  depositor     User             @relation(fields: [depositorId], references: [id])
+
+  @@index([bookingId])
+  @@index([warehouseId])
+  @@index([status])
+  @@map("gate_out_passes")
 }
 
 // ─── TESTING ──────────────────────────────────────────────────────────────────

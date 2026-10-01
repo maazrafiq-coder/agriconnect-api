@@ -2,7 +2,18 @@ import { Test } from '@nestjs/testing';
 import { BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { WarehouseService } from './warehouse.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { StorageService } from '../common/storage/storage.service';
 import { BookingStatus, ReceiptStatus, LienStatus } from '@prisma/client';
+
+// Stub — the booking lifecycle transitions covered here don't touch
+// invoice/GRN/gate-pass PDF generation directly (issueReceipt's GRN
+// side-effect is covered separately), but WarehouseService's constructor
+// now requires StorageService, so the DI container needs *something*.
+const storageStub = {
+  putObject: jest.fn(),
+  getPresignedUrl: jest.fn(),
+  deleteObject: jest.fn(),
+};
 
 /**
  * Round 2, Milestone 2 — warehouse booking state machine.
@@ -44,7 +55,7 @@ describe('WarehouseService — booking lifecycle', () => {
     };
 
     const moduleRef = await Test.createTestingModule({
-      providers: [WarehouseService, { provide: PrismaService, useValue: prisma }],
+      providers: [WarehouseService, { provide: PrismaService, useValue: prisma }, { provide: StorageService, useValue: storageStub }],
     }).compile();
 
     service = moduleRef.get(WarehouseService);

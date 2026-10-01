@@ -24,6 +24,9 @@ describe('OffersService.accept', () => {
 
   beforeEach(async () => {
     prisma = {
+      user: {
+        findUnique: jest.fn().mockResolvedValue({ kycStatus: 'APPROVED' }),
+      },
       offer: {
         findUnique: jest.fn().mockResolvedValue(baseOffer),
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
@@ -101,5 +104,46 @@ describe('OffersService.accept', () => {
     expect(entries[1].type).toBe('PLATFORM_FEE');
     // 380,000 total; fee entries should sum back to the total
     expect(Number(entries[0].amount) + Number(entries[1].amount)).toBeCloseTo(380000);
+  });
+
+  // Round 2, Milestone (NEW_Changes item 1): a user with an open info
+  // request from admin can now log in, but must still be blocked from
+  // completing a sale until fully APPROVED.
+  it('blocks accept when the seller is not APPROVED (e.g. INFO_REQUESTED)', async () => {
+    prisma.user.findUnique.mockResolvedValue({ kycStatus: 'INFO_REQUESTED' });
+    await expect(service.accept('offer-1', 'seller-1')).rejects.toThrow(ForbiddenException);
+    expect(prisma.offer.findUnique).not.toHaveBeenCalled();
+  });
+});
+
+describe('OffersService.create', () => {
+  let service: OffersService;
+  let prisma: any;
+
+  beforeEach(async () => {
+    prisma = {
+      user: { findUnique: jest.fn().mockResolvedValue({ kycStatus: 'APPROVED' }) },
+      product: {
+        findUnique: jest.fn().mockResolvedValue({ id: 'p1', sellerId: 'seller-1', minOrderQty: 10, unit: 'bags' }),
+      },
+      offer: { create: jest.fn().mockResolvedValue({ id: 'offer-new' }) },
+    };
+    const moduleRef = await Test.createTestingModule({
+      providers: [OffersService, { provide: PrismaService, useValue: prisma }],
+    }).compile();
+    service = moduleRef.get(OffersService);
+  });
+
+  it('blocks a non-APPROVED buyer from making an offer (e.g. INFO_REQUESTED)', async () => {
+    prisma.user.findUnique.mockResolvedValue({ kycStatus: 'INFO_REQUESTED' });
+    await expect(
+      service.create('buyer-1', { productId: 'p1', offeredPrice: 100, quantity: 20 }),
+    ).rejects.toThrow(ForbiddenException);
+    expect(prisma.product.findUnique).not.toHaveBeenCalled();
+  });
+
+  it('allows an APPROVED buyer to make an offer', async () => {
+    const offer = await service.create('buyer-1', { productId: 'p1', offeredPrice: 100, quantity: 20 });
+    expect(offer).toEqual({ id: 'offer-new' });
   });
 });

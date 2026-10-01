@@ -56,6 +56,7 @@ describe('ReviewService — clarification workflow', () => {
       // Round 2, Milestone 6 — provider profile subject types.
       warehouseProfile: {
         findUnique: jest.fn().mockResolvedValue({ id: 'wh-1', userId: 'operator-1' }),
+        findMany: jest.fn().mockResolvedValue([{ id: 'wh-1' }]),
       },
       testingAgencyProfile: {
         findUnique: jest.fn().mockResolvedValue({ id: 'agency-1', userId: 'operator-2' }),
@@ -265,16 +266,16 @@ describe('ReviewService — clarification workflow', () => {
     });
 
     describe('listMyProviderClarifications', () => {
-      it("resolves the caller's own warehouse profile id before listing", async () => {
+      it("resolves every warehouse the caller owns before listing (an operator can run more than one — NEW_Changes item 10)", async () => {
         await service.listMyProviderClarifications('operator-1', 'WAREHOUSE_PROFILE');
-        expect(prisma.warehouseProfile.findUnique).toHaveBeenCalledWith({ where: { userId: 'operator-1' }, select: { id: true } });
+        expect(prisma.warehouseProfile.findMany).toHaveBeenCalledWith({ where: { userId: 'operator-1' }, select: { id: true } });
         expect(prisma.reviewClarification.findMany).toHaveBeenCalledWith(
           expect.objectContaining({ where: { subjectType: 'WAREHOUSE_PROFILE', subjectId: 'wh-1' } }),
         );
       });
 
       it('returns an empty list rather than erroring if the caller has no provider profile yet', async () => {
-        prisma.warehouseProfile.findUnique.mockResolvedValue(null);
+        prisma.warehouseProfile.findMany.mockResolvedValue([]);
         const result = await service.listMyProviderClarifications('brand-new-user', 'WAREHOUSE_PROFILE');
         expect(result).toEqual([]);
       });

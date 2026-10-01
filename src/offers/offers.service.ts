@@ -35,7 +35,22 @@ export class CounterOfferDto {
 export class OffersService {
   constructor(private prisma: PrismaService) {}
 
+  // Accounts that aren't fully APPROVED yet (e.g. INFO_REQUESTED — see
+  // auth.service.login()'s comment on why those users can now log in at
+  // all) can browse and respond to admin requests, but must not be able
+  // to transact. Checked against a fresh read rather than the JWT's
+  // (possibly stale) kycStatus claim, since a previously-approved account
+  // can be moved back to INFO_REQUESTED after the token was issued.
+  private async assertCanTransact(userId: string, action: 'make an offer on' | 'accept offers on') {
+    const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { kycStatus: true } });
+    if (!user || user.kycStatus !== 'APPROVED') {
+      throw new ForbiddenException(`Your account must be fully approved before you can ${action} listings.`);
+    }
+  }
+
   async create(buyerId: string, dto: CreateOfferDto) {
+    await this.assertCanTransact(buyerId, 'make an offer on');
+
     const product = await this.prisma.product.findUnique({ where: { id: dto.productId } });
     if (!product) throw new NotFoundException('Product not found');
     if (product.sellerId === buyerId) throw new BadRequestException('Cannot make offer on your own product');
@@ -58,6 +73,8 @@ export class OffersService {
   }
 
   async accept(offerId: string, sellerId: string) {
+    await this.assertCanTransact(sellerId, 'accept offers on');
+
     const offer = await this.prisma.offer.findUnique({
       where: { id: offerId },
       include: { product: true },

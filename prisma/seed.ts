@@ -174,7 +174,7 @@ async function main() {
           province: 'Punjab',
         },
       },
-      warehouseProfile: {
+      warehouseProfiles: {
         create: {
           name: 'Punjab Cold Chain Hub',
           type: WarehouseType.COLD_STORAGE,

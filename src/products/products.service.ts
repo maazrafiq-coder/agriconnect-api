@@ -5,7 +5,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../common/storage/storage.service';
 import { withResolvedMediaUrls } from '../common/storage/media-url.util';
 import { CreateProductDto, UpdateProductDto, ProductQueryDto } from './dto/product.dto';
-import { ProductStatus } from '@prisma/client';
+import { ProductStatus, OrderStatus } from '@prisma/client';
 
 @Injectable()
 export class ProductsService {
@@ -198,6 +198,63 @@ export class ProductsService {
     };
   }
 
+  // ─── PUBLIC SELLER PROFILE (marketplace "view seller" click-through) ───────
+  async getSellerPublicProfile(sellerId: string) {
+    const seller = await this.prisma.user.findFirst({
+      // Public marketplace page — restrict to users who actually have at
+      // least one product, so this can't be used to probe arbitrary user
+      // ids (buyers, warehouse operators, etc. have no "seller" page).
+      where: { id: sellerId, productsAsSeller: { some: {} } },
+      select: {
+        id: true,
+        kycStatus: true,
+        createdAt: true,
+        profile: { select: { fullName: true, businessName: true, city: true, province: true, profilePhotoUrl: true } },
+        ratingsReceived: { select: { rating: true }, take: 200 },
+      },
+    });
+    if (!seller) throw new NotFoundException('Seller not found');
+
+    const [listings, completedSalesCount] = await this.prisma.$transaction([
+      this.prisma.product.findMany({
+        where: { sellerId, status: { in: [ProductStatus.ACTIVE, ProductStatus.UNDER_OFFER] } },
+        include: { media: { orderBy: { sortOrder: 'asc' }, take: 1 } },
+        orderBy: { createdAt: 'desc' },
+      }),
+      this.prisma.order.count({ where: { sellerId, status: OrderStatus.COMPLETED } }),
+    ]);
+
+    const ratings = seller.ratingsReceived;
+    const avgRating = ratings.length > 0 ? ratings.reduce((sum, r) => sum + r.rating, 0) / ratings.length : 0;
+
+    return {
+      id: seller.id,
+      verified: seller.kycStatus === 'APPROVED',
+      memberSince: seller.createdAt,
+      fullName: seller.profile?.fullName,
+      businessName: seller.profile?.businessName,
+      city: seller.profile?.city,
+      province: seller.profile?.province,
+      profilePhotoUrl: seller.profile?.profilePhotoUrl,
+      avgRating: Math.round(avgRating * 10) / 10,
+      totalReviews: ratings.length,
+      completedSalesCount,
+      listings: await Promise.all(listings.map(async (p) => ({
+        ...p,
+        media: await withResolvedMediaUrls(this.storage, p.media),
+        // Shaped to match findOne()'s product.seller so the frontend can
+        // run these through the same adaptProduct()/ProductCard it already
+        // has, instead of a second bespoke listing shape.
+        seller: {
+          id: seller.id,
+          kycStatus: seller.kycStatus,
+          profile: { fullName: seller.profile?.fullName, businessName: seller.profile?.businessName },
+          avgRating: Math.round(avgRating * 10) / 10,
+        },
+      }))),
+    };
+  }
+
   // ─── UPDATE ───────────────────────────────────────────────────────────────
   async update(id: string, sellerId: string, dto: UpdateProductDto) {
     const product = await this.prisma.product.findUnique({ where: { id } });
@@ -218,6 +275,32 @@ export class ProductsService {
       },
       include: { riceDetails: true },
     });
+  }
+
+  // ─── DELETE (seller's own listing) ─────────────────────────────────────────
+  async remove(id: string, sellerId: string) {
+    const product = await this.prisma.product.findUnique({ where: { id } });
+    if (!product) throw new NotFoundException('Product not found');
+    if (product.sellerId !== sellerId) throw new ForbiddenException('Not your listing');
+    if (product.status === ProductStatus.SOLD) {
+      throw new ForbiddenException('A sold listing is part of your transaction history and cannot be deleted.');
+    }
+
+    try {
+      await this.prisma.product.delete({ where: { id } });
+      return { message: 'Listing deleted.', archived: false };
+    } catch (e: any) {
+      // Offer.product has no onDelete: Cascade (deliberately — it would
+      // silently wipe out a buyer's offer history). A listing that already
+      // has offers on it hits that foreign-key constraint (P2003) instead
+      // of deleting, so fall back to the same soft-remove admin uses
+      // rather than surfacing a raw DB error to the seller.
+      if (e?.code === 'P2003') {
+        await this.prisma.product.update({ where: { id }, data: { status: ProductStatus.REMOVED } });
+        return { message: 'This listing has offers on it, so it was taken off the marketplace instead of permanently deleted.', archived: true };
+      }
+      throw e;
+    }
   }
 
   // ─── CHANGE STATUS ────────────────────────────────────────────────────────

@@ -200,35 +200,41 @@ export class ReviewService {
   }
 
   // Convenience for a provider operator's own listing clarification
-  // thread (Milestone 6) — mirrors listMyKycClarifications above, but
-  // needs the profile's `.id` (not `userId`) as subjectId, and needs to
-  // look that profile up first since the operator only knows "I am
-  // this user", not "my warehouse profile has this id".
+  // thread(s). Needs the profile's `.id` (not `userId`) as subjectId, and
+  // needs to look that profile up first since the operator only knows "I
+  // am this user", not "my warehouse profile has this id". A warehouse
+  // operator can now own more than one warehouse (NEW_Changes item 10),
+  // so this fans out across all of them and merges the threads.
   async listMyProviderClarifications(
     userId: string,
     subjectType: 'WAREHOUSE_PROFILE' | 'TESTING_AGENCY_PROFILE' | 'TRANSPORT_PROFILE',
   ) {
-    const profileId = await this.findOwnProviderProfileId(userId, subjectType);
-    if (!profileId) return [];
-    return this.listForSubject(subjectType, profileId, userId, 'BUYER'); // role arg unused when isOwner is already true
+    const profileIds = await this.findOwnProviderProfileIds(userId, subjectType);
+    if (!profileIds.length) return [];
+    const threads = await Promise.all(
+      profileIds.map((id) => this.listForSubject(subjectType, id, userId, 'BUYER')), // role arg unused when isOwner is already true
+    );
+    return threads.flat().sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
   }
 
-  private async findOwnProviderProfileId(
+  private async findOwnProviderProfileIds(
     userId: string,
     subjectType: 'WAREHOUSE_PROFILE' | 'TESTING_AGENCY_PROFILE' | 'TRANSPORT_PROFILE',
-  ): Promise<string | null> {
+  ): Promise<string[]> {
     switch (subjectType) {
       case 'WAREHOUSE_PROFILE': {
-        const p = await this.prisma.warehouseProfile.findUnique({ where: { userId }, select: { id: true } });
-        return p?.id ?? null;
+        // findMany, not findUnique — userId is no longer unique on
+        // WarehouseProfile (an operator can run several warehouses).
+        const rows = await this.prisma.warehouseProfile.findMany({ where: { userId }, select: { id: true } });
+        return rows.map((r) => r.id);
       }
       case 'TESTING_AGENCY_PROFILE': {
         const p = await this.prisma.testingAgencyProfile.findUnique({ where: { userId }, select: { id: true } });
-        return p?.id ?? null;
+        return p ? [p.id] : [];
       }
       case 'TRANSPORT_PROFILE': {
         const p = await this.prisma.transportProfile.findUnique({ where: { userId }, select: { id: true } });
-        return p?.id ?? null;
+        return p ? [p.id] : [];
       }
     }
   }
