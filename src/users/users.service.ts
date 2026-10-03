@@ -20,6 +20,9 @@ export class UsersService {
           select: {
             productsAsSeller: true, ordersAsSeller: true,
             ordersAsBuyer: true,
+            // Warehouse operators' "listings" are warehouses, not products —
+            // without this the profile tab showed 0 listings for them.
+            warehouseProfiles: true,
           },
         },
       },

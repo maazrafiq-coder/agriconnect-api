@@ -5,7 +5,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../common/storage/storage.service';
 import { ReceiptStatus, LienStatus, TransactionType, BookingStatus } from '@prisma/client';
 import {
-  IsString, IsNumber, IsOptional, IsBoolean, IsDateString, IsArray, IsObject, Min,
+  IsString, IsNumber, IsOptional, IsBoolean, IsDateString, IsArray, IsObject, IsIn, Min, MinLength, MaxLength,
 } from 'class-validator';
 import { v4 as uuidv4 } from 'uuid';
 import { withBookingReference, withBookingReferences, formatBookingReference } from '../common/utils/booking-reference.util';
@@ -133,6 +133,12 @@ export class BuyInsuranceDto {
   @IsString() coverage: string;
 }
 
+export class PostBookingMessageDto {
+  @IsString() @MinLength(1) @MaxLength(2000) body: string;
+  // INFO_REQUEST is only honoured when the sender is the warehouse operator.
+  @IsOptional() @IsIn(['MESSAGE', 'INFO_REQUEST']) kind?: 'MESSAGE' | 'INFO_REQUEST';
+}
+
 export class RejectBookingDto {
   @IsString() reason: string;
 }
@@ -224,6 +230,11 @@ export class WarehouseService {
   // warehouse (e.g. facilities in different cities) — this used to reject
   // a second registration outright.
   async create(userId: string, dto: CreateWarehouseDto) {
+    // Offering insurance without a price made the booking form's insurance
+    // option unusable ("has not set an insurance rate yet").
+    if (dto.insuranceAvailable && dto.insurancePricePerTonMonth == null) {
+      throw new BadRequestException('Set an insurance rate (₨/ton/month) or turn off "insurance available".');
+    }
     return this.prisma.warehouseProfile.create({
       data: { userId, ...dto } as any,
     });
@@ -239,6 +250,12 @@ export class WarehouseService {
     const warehouse = await this.prisma.warehouseProfile.findUnique({ where: { id: warehouseId } });
     if (!warehouse) throw new NotFoundException('Warehouse not found');
     if (warehouse.userId !== operatorId) throw new ForbiddenException('Not your warehouse');
+
+    const willOfferInsurance = dto.insuranceAvailable ?? warehouse.insuranceAvailable;
+    const rateAfter = dto.insurancePricePerTonMonth !== undefined ? dto.insurancePricePerTonMonth : warehouse.insurancePricePerTonMonth;
+    if (willOfferInsurance && rateAfter == null) {
+      throw new BadRequestException('Set an insurance rate (₨/ton/month) or turn off "insurance available".');
+    }
 
     return this.prisma.warehouseProfile.update({
       where: { id: warehouseId },
@@ -389,6 +406,7 @@ export class WarehouseService {
       where: { depositorId },
       include: {
         warehouse: { select: { name: true, city: true, province: true, managerPhone: true } },
+        _count: { select: { messages: true } },
         receipt: { select: { id: true, receiptNumber: true, status: true } },
         invoice: { select: { id: true, invoiceNumber: true, status: true, totalAmount: true } },
         goodsReceiptNote: { select: { id: true, grnNumber: true } },
@@ -405,7 +423,7 @@ export class WarehouseService {
       where: { id: bookingId },
       include: {
         warehouse: { select: { id: true, name: true, city: true, province: true, managerPhone: true, userId: true } },
-        depositor: { select: { profile: { select: { fullName: true, city: true } } } },
+        depositor: { select: { id: true, phoneNumber: true, email: true, profile: { select: { fullName: true, businessName: true, city: true, province: true } } } },
         receipt: true,
       },
     });
@@ -728,6 +746,54 @@ export class WarehouseService {
       where: { warehouseId: { in: warehouses.map((w) => w.id) } },
       include: { depositor: { select: { profile: { select: { fullName: true } } } }, warehouse: { select: { name: true } } },
       orderBy: { issuedAt: 'desc' },
+    });
+  }
+
+  // ─── BOOKING MESSAGES (depositor <-> warehouse operator) ──────────────────
+  // One thread per booking. Participants: the depositor, the operator who
+  // owns the warehouse, and (read-only) admins/moderators.
+  private async assertBookingParticipant(bookingId: string, userId: string, role: string) {
+    const booking = await this.prisma.storageBooking.findUnique({
+      where: { id: bookingId },
+      select: { id: true, depositorId: true, status: true, warehouse: { select: { userId: true } } },
+    });
+    if (!booking) throw new NotFoundException('Booking not found');
+    const isDepositor = booking.depositorId === userId;
+    const isOperator = booking.warehouse.userId === userId;
+    const isAdmin = role === 'ADMIN' || role === 'MODERATOR';
+    if (!isDepositor && !isOperator && !isAdmin) throw new ForbiddenException('Access denied');
+    return { booking, isDepositor, isOperator, isAdmin };
+  }
+
+  async getBookingMessages(bookingId: string, userId: string, role: string) {
+    await this.assertBookingParticipant(bookingId, userId, role);
+    const rows = await this.prisma.bookingMessage.findMany({
+      where: { bookingId },
+      orderBy: { createdAt: 'asc' },
+      include: { sender: { select: { id: true, profile: { select: { fullName: true, businessName: true } } } } },
+    });
+    return rows.map(m => ({
+      id: m.id,
+      kind: m.kind,
+      body: m.body,
+      createdAt: m.createdAt,
+      senderId: m.senderId,
+      senderName: m.sender?.profile?.businessName || m.sender?.profile?.fullName || 'User',
+      mine: m.senderId === userId,
+    }));
+  }
+
+  async postBookingMessage(bookingId: string, userId: string, role: string, dto: PostBookingMessageDto) {
+    const { booking, isOperator, isDepositor } = await this.assertBookingParticipant(bookingId, userId, role);
+    if (!isOperator && !isDepositor) throw new ForbiddenException('Only the depositor or the warehouse can post messages');
+    const body = dto.body.trim();
+    if (!body) throw new BadRequestException('Message cannot be empty');
+    if (booking.status === BookingStatus.CANCELLED || booking.status === BookingStatus.REJECTED) {
+      throw new BadRequestException(`This booking is ${booking.status.toLowerCase()} — the conversation is closed.`);
+    }
+    const kind = dto.kind === 'INFO_REQUEST' && isOperator ? 'INFO_REQUEST' : 'MESSAGE';
+    return this.prisma.bookingMessage.create({
+      data: { bookingId, senderId: userId, kind: kind as any, body },
     });
   }
 
@@ -1066,7 +1132,10 @@ export class WarehouseService {
       this.prisma.storageBooking.findMany({
         where: { warehouseId: warehouse.id },
         include: {
-          depositor: { select: { profile: { select: { fullName: true, city: true } } } },
+          // Full requester details so the operator can review a booking
+          // properly instead of seeing just a name and city.
+          depositor: { select: { id: true, phoneNumber: true, email: true, kycStatus: true, profile: { select: { fullName: true, businessName: true, city: true, province: true } } } },
+          _count: { select: { messages: true } },
           // Document state per booking (NEW_Changes item 10) so the
           // dashboard can show invoice/GRN/gate-pass status inline
           // without extra round trips.
@@ -1075,7 +1144,7 @@ export class WarehouseService {
           gateOutPasses: { orderBy: { createdAt: 'desc' }, take: 1 },
         },
         orderBy: { createdAt: 'desc' },
-        take: 10,
+        take: 50,
       }),
       this.prisma.warehouseReceipt.count({ where: { warehouseId: warehouse.id } }),
       this.prisma.warehouseReceipt.count({
@@ -1083,6 +1152,8 @@ export class WarehouseService {
       }),
       this.getMyWarehouses(operatorId),
     ]);
+
+    const totalBookings = await this.prisma.storageBooking.count({ where: { warehouseId: warehouse.id } });
 
     const usedCapacity = await this.prisma.storageBooking.aggregate({
       where: { warehouseId: warehouse.id, status: { in: CAPACITY_HELD_STATUSES } },
@@ -1101,7 +1172,7 @@ export class WarehouseService {
         availableCapacityTons: warehouse.totalCapacityTons - (usedCapacity._sum.quantityTons || 0),
       },
       stats: {
-        totalBookings: bookings.length,
+        totalBookings,
         totalReceipts: receipts,
         activeReceipts,
         totalRevenue: revenue._sum.totalCost || 0,

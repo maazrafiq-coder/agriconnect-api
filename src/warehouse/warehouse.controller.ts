@@ -4,7 +4,7 @@ import {
 import {
   WarehouseService, CreateWarehouseDto, UpdateWarehouseDto, BookStorageDto,
   WarehouseQueryDto, ApplyLienDto, BuyInsuranceDto,
-  RejectBookingDto, CancelBookingDto,
+  RejectBookingDto, CancelBookingDto, PostBookingMessageDto,
 } from './warehouse.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
@@ -79,6 +79,25 @@ export class WarehouseController {
   @UseGuards(JwtAuthGuard)
   getBooking(@Param('id') id: string, @CurrentUser('id') userId: string, @CurrentUser('role') role: string) {
     return this.warehouseService.getBooking(id, userId, role);
+  }
+
+  // GET /warehouse/bookings/:id/messages — conversation thread for a booking
+  @Get('bookings/:id/messages')
+  @UseGuards(JwtAuthGuard)
+  getBookingMessages(@Param('id') id: string, @CurrentUser('id') userId: string, @CurrentUser('role') role: string) {
+    return this.warehouseService.getBookingMessages(id, userId, role);
+  }
+
+  // POST /warehouse/bookings/:id/messages — depositor or operator posts (operator may flag INFO_REQUEST)
+  @Post('bookings/:id/messages')
+  @UseGuards(JwtAuthGuard)
+  postBookingMessage(
+    @Param('id') id: string,
+    @CurrentUser('id') userId: string,
+    @CurrentUser('role') role: string,
+    @Body() dto: PostBookingMessageDto,
+  ) {
+    return this.warehouseService.postBookingMessage(id, userId, role, dto);
   }
 
   // PATCH /warehouse/bookings/:id/accept — warehouse operator accepts a REQUESTED booking

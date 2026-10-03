@@ -361,6 +361,7 @@ model User {
   warehouseInvoices WarehouseInvoice[]
   goodsReceiptNotes GoodsReceiptNote[]
   gateOutPasses     GateOutPass[]
+  bookingMessages   BookingMessage[]
 
   // ── Testing / transport as requester ─────────────────────────────────────
   testingRequests   TestingRequest[]  @relation("TestingRequester")
@@ -778,11 +779,37 @@ model StorageBooking {
   invoice          WarehouseInvoice?
   goodsReceiptNote GoodsReceiptNote?
   gateOutPasses    GateOutPass[]
+  messages         BookingMessage[]
 
   @@index([warehouseId])
   @@index([depositorId])
   @@index([status])
   @@map("storage_bookings")
+}
+
+// Conversation thread attached to a single storage booking, so the
+// depositor and the warehouse operator can talk without leaving the
+// platform. INFO_REQUEST is a message the operator sends specifically to
+// ask the depositor for more details before deciding on a booking.
+// Admins/moderators can read a thread but not post to it.
+enum BookingMessageKind {
+  MESSAGE
+  INFO_REQUEST
+}
+
+model BookingMessage {
+  id        String             @id @default(uuid())
+  bookingId String
+  senderId  String
+  kind      BookingMessageKind @default(MESSAGE)
+  body      String
+  createdAt DateTime           @default(now())
+
+  booking   StorageBooking     @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  sender    User               @relation(fields: [senderId], references: [id])
+
+  @@index([bookingId, createdAt])
+  @@map("booking_messages")
 }
 
 model WarehouseReceipt {
