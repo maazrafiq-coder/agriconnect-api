@@ -5,13 +5,16 @@ import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../common/storage/storage.service';
 import { withResolvedMediaUrls } from '../common/storage/media-url.util';
 import { CreateProductDto, UpdateProductDto, ProductQueryDto } from './dto/product.dto';
-import { ProductStatus, OrderStatus } from '@prisma/client';
+import { ProductStatus, OrderStatus, NotificationType } from '@prisma/client';
+import { recordAudit } from '../common/utils/audit.util';
+import { NotificationsService } from '../notifications/notifications.service';
 
 @Injectable()
 export class ProductsService {
   constructor(
     private prisma: PrismaService,
     private storage: StorageService,
+    private notifications: NotificationsService,
   ) {}
 
   // Round 2, Milestone 4 — every product query below includes `media`
@@ -153,7 +156,14 @@ export class ProductsService {
   }
 
   // ─── FIND ONE ─────────────────────────────────────────────────────────────
-  async findOne(id: string) {
+  // Listing states a guest/other user may open. Everything else (DRAFT,
+  // PENDING_REVIEW, REJECTED, PAUSED, REMOVED) is visible only to the
+  // owner, admins/moderators, or someone who already has an offer on it.
+  private static readonly PUBLIC_STATUSES: ProductStatus[] = [
+    ProductStatus.ACTIVE, ProductStatus.UNDER_OFFER, ProductStatus.SOLD,
+  ];
+
+  async findOne(id: string, viewer?: { id: string; role: string }) {
     const product = await this.prisma.product.findUnique({
       where: { id },
       include: {
@@ -163,7 +173,13 @@ export class ProductsService {
             id: true,
             kycStatus: true,
             createdAt: true,
-            profile: true,
+            // Public page: never expose CNIC, DOB, address, bank/IBAN, NTN.
+            profile: {
+              select: {
+                fullName: true, businessName: true, city: true, province: true,
+                profilePhotoUrl: true, farmLocation: true,
+              },
+            },
             ratingsReceived: {
               select: { rating: true },
               take: 100,
@@ -177,8 +193,20 @@ export class ProductsService {
     });
     if (!product) throw new NotFoundException('Product not found');
 
-    // Increment view count
-    await this.prisma.product.update({ where: { id }, data: { viewCount: { increment: 1 } } });
+    const isOwner = !!viewer && product.sellerId === viewer.id;
+    const isStaff = viewer?.role === 'ADMIN' || viewer?.role === 'MODERATOR';
+    if (!ProductsService.PUBLIC_STATUSES.includes(product.status) && !isOwner && !isStaff) {
+      const hasOffer = viewer
+        ? await this.prisma.offer.findFirst({ where: { productId: id, buyerId: viewer.id }, select: { id: true } })
+        : null;
+      // Same message as a missing product so IDs can't be probed.
+      if (!hasOffer) throw new NotFoundException('Product not found');
+    }
+
+    // Increment view count (not for the owner browsing their own listing)
+    if (!isOwner) {
+      await this.prisma.product.update({ where: { id }, data: { viewCount: { increment: 1 } } });
+    }
 
     // Calculate seller rating
     const ratings = product.seller.ratingsReceived;
@@ -267,10 +295,26 @@ export class ProductsService {
     // (presumably corrected) new version.
     const resubmitting = product.status === ProductStatus.REJECTED;
 
+    if (product.status === ProductStatus.SOLD || product.status === ProductStatus.REMOVED) {
+      throw new BadRequestException(`A ${product.status.toLowerCase()} listing cannot be edited.`);
+    }
+
+    const { riceDetails, ...fields } = dto;
+    const nextQty = fields.quantity ?? product.quantity;
+    const nextMin = fields.minOrderQty ?? product.minOrderQty;
+    if (nextMin > nextQty) {
+      throw new BadRequestException('Minimum order cannot be more than the quantity available.');
+    }
+
     return this.prisma.product.update({
       where: { id },
       data: {
-        ...dto,
+        ...fields,
+        ...(fields.harvestDate && { harvestDate: new Date(fields.harvestDate) }),
+        ...(riceDetails && {
+          // The listing may have been created without rice quality details.
+          riceDetails: { upsert: { create: riceDetails, update: riceDetails } },
+        }),
         ...(resubmitting && { status: ProductStatus.PENDING_REVIEW, rejectionNote: null }),
       },
       include: { riceDetails: true },
@@ -458,13 +502,22 @@ export class ProductsService {
    * a listing appear on the public marketplace for the first time (see
    * findAll(), which only ever returns status: ACTIVE).
    */
-  async adminApprove(productId: string) {
+  async adminApprove(productId: string, actorId?: string) {
     const product = await this.prisma.product.findUnique({ where: { id: productId } });
     if (!product) throw new NotFoundException('Product not found');
-    return this.prisma.product.update({
+    const updated = await this.prisma.product.update({
       where: { id: productId },
       data: { status: ProductStatus.ACTIVE, rejectionNote: null },
     });
+    await recordAudit(this.prisma, actorId, 'product_approved', 'product', productId);
+    await this.notifications.notify({
+      userId: product.sellerId,
+      type: NotificationType.SYSTEM,
+      title: 'Your listing is live',
+      body: `${product.name} was approved and is now visible on the marketplace.`,
+      data: { link: '/seller', productId },
+    });
+    return updated;
   }
 
   /**
@@ -475,13 +528,22 @@ export class ProductsService {
    * got taken down for fraud/policy violation, a heavier action with no
    * self-service path back.
    */
-  async adminReject(productId: string, reason: string) {
+  async adminReject(productId: string, reason: string, actorId?: string) {
     const product = await this.prisma.product.findUnique({ where: { id: productId } });
     if (!product) throw new NotFoundException('Product not found');
-    return this.prisma.product.update({
+    const updated = await this.prisma.product.update({
       where: { id: productId },
       data: { status: ProductStatus.REJECTED, rejectionNote: reason },
     });
+    await recordAudit(this.prisma, actorId, 'product_rejected', 'product', productId, { reason });
+    await this.notifications.notify({
+      userId: product.sellerId,
+      type: NotificationType.SYSTEM,
+      title: 'Your listing needs changes',
+      body: `${product.name} was not approved: ${reason}. Edit it and save to resubmit.`,
+      data: { link: '/seller', productId },
+    });
+    return updated;
   }
 
   /**
@@ -489,19 +551,23 @@ export class ProductsService {
    * own changeStatus(), this bypasses the ownership check entirely — an
    * admin can act on any listing — and records the reason for audit.
    */
-  async adminRemove(productId: string, reason: string) {
+  async adminRemove(productId: string, reason: string, actorId?: string) {
     const product = await this.prisma.product.findUnique({ where: { id: productId } });
     if (!product) throw new NotFoundException('Product not found');
 
-    return this.prisma.product.update({
+    const removed = await this.prisma.product.update({
       where: { id: productId },
       data: { status: ProductStatus.REMOVED, description: `${product.description || ''}\n\n[REMOVED BY ADMIN: ${reason}]`.trim() },
     });
+    await recordAudit(this.prisma, actorId, 'product_removed', 'product', productId, { reason });
+    return removed;
   }
 
-  async adminRestore(productId: string) {
+  async adminRestore(productId: string, actorId?: string) {
     const product = await this.prisma.product.findUnique({ where: { id: productId } });
     if (!product) throw new NotFoundException('Product not found');
-    return this.prisma.product.update({ where: { id: productId }, data: { status: ProductStatus.ACTIVE } });
+    const restored = await this.prisma.product.update({ where: { id: productId }, data: { status: ProductStatus.ACTIVE } });
+    await recordAudit(this.prisma, actorId, 'product_restored', 'product', productId);
+    return restored;
   }
 }

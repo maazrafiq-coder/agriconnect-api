@@ -3,7 +3,10 @@ import {
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../common/storage/storage.service';
-import { ReceiptStatus, LienStatus, TransactionType, BookingStatus } from '@prisma/client';
+import { NotificationsService } from '../notifications/notifications.service';
+import { recordAudit } from '../common/utils/audit.util';
+import { SettingsService } from '../settings/settings.service';
+import { ReceiptStatus, LienStatus, TransactionType, BookingStatus, NotificationType } from '@prisma/client';
 import {
   IsString, IsNumber, IsOptional, IsBoolean, IsDateString, IsArray, IsObject, IsIn, Min, MinLength, MaxLength,
 } from 'class-validator';
@@ -22,6 +25,13 @@ const CAPACITY_HELD_STATUSES: BookingStatus[] = [
   BookingStatus.ACCEPTED,
   BookingStatus.ACTIVE,
 ];
+
+// A lien blocks release of the goods from the moment it is applied for
+// (PENDING) until the bank's clearance is recorded — otherwise the goods
+// could leave the warehouse while the application is still being decided.
+const LIEN_BLOCKING_STATUSES: LienStatus[] = [LienStatus.PENDING, LienStatus.ACTIVE];
+
+const INVOICEABLE_STATUSES: BookingStatus[] = [BookingStatus.ACCEPTED, BookingStatus.ACTIVE, BookingStatus.COMPLETED];
 
 // Round 2 Milestone 2: explicit allow-list of legal transitions. Anything
 // not listed here is rejected with a clear error instead of silently
@@ -124,13 +134,22 @@ export class ApplyLienDto {
   @IsOptional() @IsString() loanOfficer?: string;
 }
 
+export class ConfirmLienDto {
+  @IsString() @MinLength(3) loanRefNo: string;           // bank's loan / sanction reference
+  @IsOptional() @IsNumber() @Min(0) interestRate?: number; // final rate, if different from the indicative one applied for
+  @IsOptional() @IsString() note?: string;
+}
+
+// Only receiptId matters: provider, premium and cover are worked out on the
+// server from the warehouse's own insurance rate and the receipt's value.
+// The other fields are accepted (and ignored) so older clients don't break.
 export class BuyInsuranceDto {
   @IsString() receiptId: string;
-  @IsString() provider: string;
-  @IsString() planName: string;
-  @IsNumber() @Min(0) coverageAmount: number;
-  @IsNumber() @Min(0) premiumAmount: number;
-  @IsString() coverage: string;
+  @IsOptional() @IsString() provider?: string;
+  @IsOptional() @IsString() planName?: string;
+  @IsOptional() @IsNumber() @Min(0) coverageAmount?: number;
+  @IsOptional() @IsNumber() @Min(0) premiumAmount?: number;
+  @IsOptional() @IsString() coverage?: string;
 }
 
 export class PostBookingMessageDto {
@@ -150,7 +169,49 @@ export class CancelBookingDto {
 // ─── SERVICE ─────────────────────────────────────────────────────────────────
 @Injectable()
 export class WarehouseService {
-  constructor(private prisma: PrismaService, private storage: StorageService) {}
+  constructor(
+    private prisma: PrismaService,
+    private storage: StorageService,
+    private notifications: NotificationsService,
+    private settings: SettingsService,
+  ) {}
+
+  // A booking invoice's money is booked in the ledger only when payment is
+  // actually confirmed (see confirmInvoicePayment) and reversed with a
+  // REFUND row if that booking is then cancelled / rejected.
+  private async refundIfPaid(tx: any, booking: { id: string; depositorId: string }, reason: string) {
+    const invoice = await tx.warehouseInvoice.findUnique({ where: { bookingId: booking.id } });
+    if (!invoice || invoice.status !== 'PAID') return;
+    await tx.transaction.create({
+      data: {
+        userId: booking.depositorId,
+        type: TransactionType.REFUND,
+        amount: invoice.totalAmount,
+        description: `Refund due: storage booking ${reason} after invoice ${invoice.invoiceNumber} was paid`,
+        referenceId: booking.id,
+        referenceType: 'storage',
+      },
+    });
+  }
+
+  // ─── LIEN GUARD ───────────────────────────────────────────────────────────
+  // Goods under an ACTIVE bank lien are the bank's collateral: the warehouse
+  // must not release them (no gate-out pass) until the bank's clearance has
+  // been recorded via releaseLien(). Returns the lien or null.
+  private async getActiveLien(bookingId: string) {
+    const receipt = await this.prisma.warehouseReceipt.findUnique({
+      where: { bookingId },
+      include: { lien: true },
+    });
+    return receipt?.lien && LIEN_BLOCKING_STATUSES.includes(receipt.lien.status) ? receipt.lien : null;
+  }
+
+  private lienBlockMessage(lien: { bankName: string; loanAmount: any; status?: LienStatus }, action: string) {
+    if (lien.status === LienStatus.PENDING) {
+      return `A ₨${Number(lien.loanAmount).toLocaleString()} loan application with ${lien.bankName} is pending confirmation on these goods. ${action} until it is confirmed and cleared, or declined / withdrawn.`;
+    }
+    return `These goods are under an active bank lien (${lien.bankName}, ₨${Number(lien.loanAmount).toLocaleString()}). ${action} until the bank's clearance has been recorded.`;
+  }
 
   // ─── BROWSE WAREHOUSES ────────────────────────────────────────────────────
   async findAll(query: WarehouseQueryDto) {
@@ -320,17 +381,6 @@ export class WarehouseService {
       throw new BadRequestException(`Minimum storage duration is ${warehouse.minDurationDays} days`);
     }
 
-    // Check available capacity
-    const activeBookings = await this.prisma.storageBooking.aggregate({
-      where: { warehouseId: dto.warehouseId, status: { in: CAPACITY_HELD_STATUSES } },
-      _sum: { quantityTons: true },
-    });
-    const usedTons = activeBookings._sum.quantityTons || 0;
-    const available = warehouse.totalCapacityTons - usedTons;
-    if (dto.quantityTons > available) {
-      throw new BadRequestException(`Only ${available} tons available. Requested ${dto.quantityTons} tons.`);
-    }
-
     const entryDate = new Date(dto.entryDate);
     const exitDate = new Date(entryDate);
     exitDate.setDate(exitDate.getDate() + dto.durationDays);
@@ -353,7 +403,21 @@ export class WarehouseService {
     }
     const totalCost = storageCost + insuranceCost;
 
-    const booking = await this.prisma.storageBooking.create({
+    // Capacity check + insert run in ONE transaction, with the warehouse row
+    // locked, so two simultaneous requests can't both pass the check and
+    // oversell the warehouse.
+    const booking = await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM warehouse_profiles WHERE id = ${dto.warehouseId} FOR UPDATE`;
+      const activeBookings = await tx.storageBooking.aggregate({
+        where: { warehouseId: dto.warehouseId, status: { in: CAPACITY_HELD_STATUSES } },
+        _sum: { quantityTons: true },
+      });
+      const usedTons = activeBookings._sum.quantityTons || 0;
+      const available = warehouse.totalCapacityTons - usedTons;
+      if (dto.quantityTons > available) {
+        throw new BadRequestException(`Only ${available} tons available. Requested ${dto.quantityTons} tons.`);
+      }
+      return tx.storageBooking.create({
       data: {
         warehouseId: dto.warehouseId,
         depositorId,
@@ -375,17 +439,20 @@ export class WarehouseService {
         warehouse: { select: { name: true, city: true, managerPhone: true } },
       },
     });
-
-    await this.prisma.transaction.create({
-      data: {
-        userId: depositorId,
-        type: TransactionType.STORAGE_FEE,
-        amount: totalCost,
-        description: `Storage booking request at ${booking.warehouse.name} (${dto.quantityTons} tons, ${dto.durationDays} days)`,
-        referenceId: booking.id,
-        referenceType: 'storage',
-      },
     });
+
+    // Tell the warehouse operator a request is waiting — previously they
+    // only found out by opening their dashboard.
+    await this.notifications.notify({
+      userId: warehouse.userId,
+      type: NotificationType.WAREHOUSE_UPDATE,
+      title: 'New storage booking request',
+      body: `${withBookingReference(booking).bookingReference}: ${dto.quantityTons} tons of ${dto.commodity} for ${dto.durationDays} days at ${booking.warehouse.name}.`,
+      data: { link: '/warehouse-portal', bookingId: booking.id },
+    });
+
+    // No ledger row at request time: nothing has been paid. The storage fee
+    // is booked when the invoice payment is confirmed (confirmInvoicePayment).
 
     return {
       booking: withBookingReference(booking),
@@ -407,7 +474,7 @@ export class WarehouseService {
       include: {
         warehouse: { select: { name: true, city: true, province: true, managerPhone: true } },
         _count: { select: { messages: true } },
-        receipt: { select: { id: true, receiptNumber: true, status: true } },
+        receipt: { select: { id: true, receiptNumber: true, status: true, lien: { select: { id: true, bankName: true, loanAmount: true, status: true, placedAt: true } } } },
         invoice: { select: { id: true, invoiceNumber: true, status: true, totalAmount: true } },
         goodsReceiptNote: { select: { id: true, grnNumber: true } },
         gateOutPasses: { orderBy: { createdAt: 'desc' }, take: 1 },
@@ -424,7 +491,7 @@ export class WarehouseService {
       include: {
         warehouse: { select: { id: true, name: true, city: true, province: true, managerPhone: true, userId: true } },
         depositor: { select: { id: true, phoneNumber: true, email: true, profile: { select: { fullName: true, businessName: true, city: true, province: true } } } },
-        receipt: true,
+        receipt: { include: { lien: true } },
       },
     });
     if (!booking) throw new NotFoundException('Booking not found');
@@ -450,6 +517,13 @@ export class WarehouseService {
       data: { status: BookingStatus.ACCEPTED, acceptedAt: new Date() },
       include: { warehouse: { select: { name: true, city: true } } },
     });
+    await this.notifications.notify({
+      userId: booking.depositorId,
+      type: NotificationType.WAREHOUSE_UPDATE,
+      title: 'Booking accepted',
+      body: `${withBookingReference(updated).bookingReference} was accepted by ${updated.warehouse.name}. Deliver your goods by the entry date.`,
+      data: { link: '/warehouse', bookingId },
+    });
     return withBookingReference(updated);
   }
 
@@ -463,10 +537,21 @@ export class WarehouseService {
     if (booking.warehouse.userId !== operatorId) throw new ForbiddenException('Not your warehouse');
     assertTransition(booking.status, BookingStatus.REJECTED);
 
-    const updated = await this.prisma.storageBooking.update({
-      where: { id: bookingId },
-      data: { status: BookingStatus.REJECTED, rejectedAt: new Date(), rejectionReason: dto.reason },
-      include: { warehouse: { select: { name: true, city: true } } },
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const u = await tx.storageBooking.update({
+        where: { id: bookingId },
+        data: { status: BookingStatus.REJECTED, rejectedAt: new Date(), rejectionReason: dto.reason },
+        include: { warehouse: { select: { name: true, city: true } } },
+      });
+      await this.refundIfPaid(tx, booking, 'was declined');
+      return u;
+    });
+    await this.notifications.notify({
+      userId: booking.depositorId,
+      type: NotificationType.WAREHOUSE_UPDATE,
+      title: 'Booking declined',
+      body: `${withBookingReference(updated).bookingReference} was declined by ${updated.warehouse.name}: ${dto.reason}`,
+      data: { link: '/warehouse', bookingId },
     });
     return withBookingReference(updated);
   }
@@ -484,10 +569,14 @@ export class WarehouseService {
     if (!isOwner && !isOperator && !isAdmin) throw new ForbiddenException('Not your booking');
     assertTransition(booking.status, BookingStatus.CANCELLED);
 
-    const updated = await this.prisma.storageBooking.update({
-      where: { id: bookingId },
-      data: { status: BookingStatus.CANCELLED, cancelledAt: new Date(), cancelReason: dto.reason },
-      include: { warehouse: { select: { name: true, city: true } } },
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const u = await tx.storageBooking.update({
+        where: { id: bookingId },
+        data: { status: BookingStatus.CANCELLED, cancelledAt: new Date(), cancelReason: dto.reason },
+        include: { warehouse: { select: { name: true, city: true } } },
+      });
+      await this.refundIfPaid(tx, booking, 'was cancelled');
+      return u;
     });
     return withBookingReference(updated);
   }
@@ -501,8 +590,18 @@ export class WarehouseService {
     if (!booking) throw new NotFoundException('Booking not found');
     if (booking.warehouse.userId !== operatorId) throw new ForbiddenException('Not your warehouse');
     assertTransition(booking.status, BookingStatus.COMPLETED);
-    if (booking.receipt?.lien && booking.receipt.lien.status === LienStatus.ACTIVE) {
-      throw new BadRequestException('This receipt still has an active bank lien — it must be released before the booking can be completed');
+    if (booking.receipt?.lien && LIEN_BLOCKING_STATUSES.includes(booking.receipt.lien.status)) {
+      throw new BadRequestException('This receipt still has a pending or active bank lien — it must be cleared before the booking can be completed');
+    }
+    // Goods must actually have been released: completing a booking without
+    // an approved gate-out pass would close it while the stock is still
+    // on the floor (or released with no authorisation on record).
+    const approvedPass = await this.prisma.gateOutPass.findFirst({
+      where: { bookingId, status: 'APPROVED' as any },
+      select: { id: true },
+    });
+    if (!approvedPass) {
+      throw new BadRequestException('An approved gate-out pass is required before this booking can be completed — request release and have the depositor approve it first');
     }
 
     const [updated] = await this.prisma.$transaction([
@@ -541,70 +640,88 @@ export class WarehouseService {
       );
     }
 
-    const receiptNumber = `WR-${new Date().getFullYear()}-${String(Math.floor(Math.random() * 9000 + 1000)).padStart(4, '0')}`;
+    // Collateral value comes from the admin-maintained commodity price table
+    // (Settings). With no price configured the receipt is still issued — the
+    // operator must not be blocked — but its value is 0 ("valuation pending"):
+    // no loan can be applied against it until an admin sets the price, at
+    // which point SettingsService.setCommodityPrice values it automatically.
+    const pricePerTon = await this.settings.getCommodityPricePerTon(booking.commodity);
+    const marketValue = pricePerTon ? Math.round(actualQuantityTons * pricePerTon * 100) / 100 : 0;
 
-    // Estimate market value (simplified — in production use live price feed)
-    const pricePerTon = 38000; // example PKR/ton for rice
-    const marketValue = actualQuantityTons * pricePerTon;
+    // Receipt + number + booking ACTIVE + GRN happen atomically: either the
+    // goods are fully received into the system or nothing is.
+    try {
+      // (cast: the options argument isn't in the sandbox's Prisma shim typings)
+      return await (this.prisma as any).$transaction(async (tx: any) => {
+        const include = {
+          warehouse: { select: { name: true, city: true } },
+          owner: { select: { profile: { select: { fullName: true } } } },
+        };
+        // receiptNumber is UNIQUE, so the temporary value must be unique too
+        // (a shared 'PENDING' string would collide under concurrency).
+        const seqHolder = await tx.warehouseReceipt.create({
+          data: {
+            receiptNumber: `TMP-${uuidv4()}`,
+            bookingId,
+            warehouseId: booking.warehouseId,
+            ownerId: booking.depositorId,
+            commodity: booking.commodity,
+            variety: booking.variety,
+            quantityTons: actualQuantityTons,
+            qualityMetrics,
+            entryDate: booking.entryDate,
+            expiryDate: booking.exitDate,
+            marketValue,
+            status: ReceiptStatus.ACTIVE,
+          },
+        });
+        const receipt = await tx.warehouseReceipt.update({
+          where: { id: seqHolder.id },
+          data: { receiptNumber: formatDocumentNumber('WR', seqHolder.receiptSeq, seqHolder.createdAt) },
+          include,
+        });
 
-    const receipt = await this.prisma.warehouseReceipt.create({
-      data: {
-        receiptNumber,
-        bookingId,
-        warehouseId: booking.warehouseId,
-        ownerId: booking.depositorId,
-        commodity: booking.commodity,
-        variety: booking.variety,
-        quantityTons: actualQuantityTons,
-        qualityMetrics,
-        entryDate: booking.entryDate,
-        expiryDate: booking.exitDate,
-        marketValue,
-        status: ReceiptStatus.ACTIVE,
-      },
-      include: {
-        warehouse: { select: { name: true, city: true } },
-        owner: { select: { profile: { select: { fullName: true } } } },
-      },
-    });
+        // Goods have physically arrived and been weighed/quality-checked —
+        // booking moves from ACCEPTED to ACTIVE (guarded against a race).
+        const moved = await tx.storageBooking.updateMany({
+          where: { id: bookingId, status: BookingStatus.ACCEPTED },
+          data: { status: BookingStatus.ACTIVE },
+        });
+        if (moved.count === 0) throw new BadRequestException('This booking was just updated — refresh and try again');
 
-    // Goods have physically arrived and been weighed/quality-checked —
-    // booking moves from ACCEPTED to ACTIVE.
-    await this.prisma.storageBooking.update({
-      where: { id: bookingId },
-      data: { status: BookingStatus.ACTIVE },
-    });
+        // A formal Goods Receipt Note is issued at exactly this moment.
+        // Distinct from the WarehouseReceipt above (collateral document).
+        await this.issueGoodsReceiptNote(tx, booking, operatorId, actualQuantityTons, qualityMetrics);
 
-    // NEW_Changes item 10: a formal Goods Receipt Note, issued at exactly
-    // this moment — this IS "when the goods are received" in the system,
-    // so there's no separate manual step for it. Distinct from the
-    // WarehouseReceipt above (that's a collateral/ownership document used
-    // for bank liens and insurance; this is the delivery acknowledgment).
-    await this.issueGoodsReceiptNote(booking, operatorId, actualQuantityTons, qualityMetrics);
-
-    return receipt;
+        return receipt;
+      }, { timeout: 30000 });
+    } catch (e: any) {
+      if (e?.code === 'P2002') throw new BadRequestException('Receipt already issued for this booking');
+      throw e;
+    }
   }
 
   private async issueGoodsReceiptNote(
+    tx: any,
     booking: { id: string; warehouseId: string; depositorId: string; commodity: string; variety: string | null },
     operatorId: string,
     quantityTons: number,
     qualityMetrics: any,
   ) {
     const [warehouse, depositor] = await Promise.all([
-      this.prisma.warehouseProfile.findUnique({ where: { id: booking.warehouseId } }),
-      this.prisma.user.findUnique({ where: { id: booking.depositorId }, select: { profile: { select: { fullName: true } } } }),
+      tx.warehouseProfile.findUnique({ where: { id: booking.warehouseId } }),
+      tx.user.findUnique({ where: { id: booking.depositorId }, select: { profile: { select: { fullName: true } } } }),
     ]);
 
     const qualityNotes = qualityMetrics == null ? null
       : typeof qualityMetrics === 'string' ? qualityMetrics
       : JSON.stringify(qualityMetrics);
 
-    // Reserve the seq first (a throwaway create+read would work too, but
-    // this way the PDF can embed the real grnNumber from the start).
-    const seqHolder = await this.prisma.goodsReceiptNote.create({
+    // Reserve the seq first so the PDF can embed the real grnNumber. The
+    // placeholder is unique per call (grnNumber is UNIQUE).
+    const seqHolder = await tx.goodsReceiptNote.create({
       data: {
-        grnNumber: 'PENDING',
+        grnNumber: `TMP-${uuidv4()}`,
         bookingId: booking.id,
         warehouseId: booking.warehouseId,
         depositorId: booking.depositorId,
@@ -636,7 +753,7 @@ export class WarehouseService {
     const s3Key = `warehouse-documents/grn-${seqHolder.id}.pdf`;
     await this.storage.putObject(s3Key, pdfBuffer, 'application/pdf');
 
-    return this.prisma.goodsReceiptNote.update({
+    return tx.goodsReceiptNote.update({
       where: { id: seqHolder.id },
       data: { grnNumber, s3Key },
     });
@@ -655,6 +772,9 @@ export class WarehouseService {
     if (!booking) throw new NotFoundException('Booking not found');
     if (booking.warehouse.userId !== operatorId) throw new ForbiddenException('Not your warehouse');
     if (booking.invoice) throw new BadRequestException('An invoice has already been generated for this booking');
+    if (!INVOICEABLE_STATUSES.includes(booking.status)) {
+      throw new BadRequestException(`An invoice can only be issued for an accepted booking (current status: ${booking.status}).`);
+    }
 
     const [depositor] = await Promise.all([
       this.prisma.user.findUnique({ where: { id: booking.depositorId }, select: { profile: { select: { fullName: true, address: true, city: true } } } }),
@@ -664,7 +784,7 @@ export class WarehouseService {
 
     const seqHolder = await this.prisma.warehouseInvoice.create({
       data: {
-        invoiceNumber: 'PENDING',
+        invoiceNumber: `TMP-${uuidv4()}`,
         bookingId: booking.id,
         warehouseId: booking.warehouseId,
         depositorId: booking.depositorId,
@@ -707,15 +827,56 @@ export class WarehouseService {
   // there's no gateway callback here. Operator (of that warehouse) or any
   // admin/moderator can confirm.
   async confirmInvoicePayment(userId: string, userRole: string, invoiceId: string, paymentReference?: string) {
-    const invoice = await this.prisma.warehouseInvoice.findUnique({ where: { id: invoiceId }, include: { warehouse: true } });
+    const invoice = await this.prisma.warehouseInvoice.findUnique({
+      where: { id: invoiceId },
+      include: { warehouse: true, booking: { select: { status: true } } },
+    });
     if (!invoice) throw new NotFoundException('Invoice not found');
     const isAdmin = userRole === 'ADMIN' || userRole === 'MODERATOR';
     if (invoice.warehouse.userId !== userId && !isAdmin) throw new ForbiddenException('Not authorized to confirm this payment');
     if (invoice.status === 'PAID') throw new BadRequestException('This invoice is already marked as paid');
+    if (
+  invoice.booking &&
+  (
+    invoice.booking.status === BookingStatus.CANCELLED ||
+    invoice.booking.status === BookingStatus.REJECTED
+  )
+) {
+      throw new BadRequestException(`This booking was ${invoice.booking.status.toLowerCase()} — its invoice can no longer be paid.`);
+    }
 
-    return this.prisma.warehouseInvoice.update({
-      where: { id: invoiceId },
-      data: { status: 'PAID', paidAt: new Date(), paymentReference, confirmedById: userId },
+    // The money is booked in the ledger HERE — the moment payment is
+    // confirmed — and the invoice flip is guarded so a double-click can't
+    // book it twice.
+    return this.prisma.$transaction(async (tx) => {
+      const flipped = await tx.warehouseInvoice.updateMany({
+        where: { id: invoiceId, status: 'UNPAID' },
+        data: { status: 'PAID', paidAt: new Date(), paymentReference, confirmedById: userId },
+      });
+      if (flipped.count === 0) throw new BadRequestException('This invoice is already marked as paid');
+
+      const storageAmount = Number(invoice.storageCost);
+      const insuranceAmount = Number(invoice.insuranceCost || 0);
+      const rows: any[] = [{
+        userId: invoice.depositorId,
+        type: TransactionType.STORAGE_FEE,
+        amount: storageAmount,
+        description: `Storage fee paid — invoice ${invoice.invoiceNumber}`,
+        referenceId: invoice.bookingId,
+        referenceType: 'storage',
+      }];
+      if (insuranceAmount > 0) {
+        rows.push({
+          userId: invoice.depositorId,
+          type: TransactionType.INSURANCE_PREMIUM,
+          amount: insuranceAmount,
+          description: `Storage insurance paid — invoice ${invoice.invoiceNumber}`,
+          referenceId: invoice.bookingId,
+          referenceType: 'storage',
+        });
+      }
+      await tx.transaction.createMany({ data: rows });
+      return tx.warehouseInvoice.findUnique({ where: { id: invoiceId } });
     });
   }
 
@@ -755,7 +916,7 @@ export class WarehouseService {
   private async assertBookingParticipant(bookingId: string, userId: string, role: string) {
     const booking = await this.prisma.storageBooking.findUnique({
       where: { id: bookingId },
-      select: { id: true, depositorId: true, status: true, warehouse: { select: { userId: true } } },
+      select: { id: true, depositorId: true, status: true, bookingSeq: true, createdAt: true, warehouse: { select: { userId: true, name: true } } },
     });
     if (!booking) throw new NotFoundException('Booking not found');
     const isDepositor = booking.depositorId === userId;
@@ -792,9 +953,18 @@ export class WarehouseService {
       throw new BadRequestException(`This booking is ${booking.status.toLowerCase()} — the conversation is closed.`);
     }
     const kind = dto.kind === 'INFO_REQUEST' && isOperator ? 'INFO_REQUEST' : 'MESSAGE';
-    return this.prisma.bookingMessage.create({
+    const created = await this.prisma.bookingMessage.create({
       data: { bookingId, senderId: userId, kind: kind as any, body },
     });
+    const ref = formatBookingReference(booking.bookingSeq, booking.createdAt);
+    await this.notifications.notify({
+      userId: isOperator ? booking.depositorId : booking.warehouse.userId,
+      type: NotificationType.WAREHOUSE_UPDATE,
+      title: kind === 'INFO_REQUEST' ? 'Warehouse needs more information' : 'New message on your booking',
+      body: `${ref}: ${body.length > 120 ? body.slice(0, 117) + '…' : body}`,
+      data: { link: isOperator ? '/warehouse' : '/warehouse-portal', bookingId },
+    });
+    return created;
   }
 
   // ─── GOODS RECEIPT NOTE (read access — issued automatically by
@@ -823,10 +993,12 @@ export class WarehouseService {
     if (booking.status !== BookingStatus.ACTIVE) {
       throw new BadRequestException(`Goods must be in active storage before a gate-out pass can be requested (current status: ${booking.status}).`);
     }
+    const activeLien = await this.getActiveLien(bookingId);
+    if (activeLien) throw new BadRequestException(this.lienBlockMessage(activeLien, 'A gate-out pass cannot be requested'));
     const existingPending = await this.prisma.gateOutPass.findFirst({ where: { bookingId, status: 'PENDING' } });
     if (existingPending) throw new BadRequestException('There is already a pending gate-out request for this booking');
 
-    return this.prisma.gateOutPass.create({
+    const created = await this.prisma.gateOutPass.create({
       data: {
         bookingId,
         warehouseId: booking.warehouseId,
@@ -836,6 +1008,14 @@ export class WarehouseService {
         requestNote,
       },
     });
+    await this.notifications.notify({
+      userId: booking.depositorId,
+      type: NotificationType.WAREHOUSE_UPDATE,
+      title: 'Release of your goods requested',
+      body: `${booking.warehouse.name} has requested your approval to release ${created.quantityTons} tons of ${booking.commodity}.`,
+      data: { link: '/warehouse', bookingId },
+    });
+    return created;
   }
 
   async approveGateOut(userId: string, userRole: string, passId: string) {
@@ -845,6 +1025,10 @@ export class WarehouseService {
     const isDepositor = pass.depositorId === userId;
     if (!isAdmin && !isDepositor) throw new ForbiddenException('Only the depositor or an admin can approve a gate-out request');
     if (pass.status !== 'PENDING') throw new BadRequestException(`This request has already been ${pass.status.toLowerCase()}`);
+    // A lien may have been placed after the request was raised — re-check
+    // so a pass can't be issued for goods that are now the bank's collateral.
+    const activeLien = await this.getActiveLien(pass.bookingId);
+    if (activeLien) throw new BadRequestException(this.lienBlockMessage(activeLien, 'The gate-out pass cannot be issued'));
 
     const approvedAt = new Date();
     const passNumber = formatDocumentNumber('GOP', pass.passSeq, approvedAt);
@@ -871,7 +1055,7 @@ export class WarehouseService {
     const s3Key = `warehouse-documents/gate-pass-${pass.id}.pdf`;
     await this.storage.putObject(s3Key, pdfBuffer, 'application/pdf');
 
-    return this.prisma.gateOutPass.update({
+    const approved = await this.prisma.gateOutPass.update({
       where: { id: passId },
       data: {
         status: 'APPROVED',
@@ -882,20 +1066,36 @@ export class WarehouseService {
         s3Key,
       },
     });
+    await this.notifications.notify({
+      userId: pass.warehouse.userId,
+      type: NotificationType.WAREHOUSE_UPDATE,
+      title: 'Gate-out approved',
+      body: `${passNumber} was approved for ${pass.quantityTons} tons of ${pass.booking.commodity}. You can release the goods.`,
+      data: { link: '/warehouse-portal', bookingId: pass.bookingId },
+    });
+    return approved;
   }
 
   async rejectGateOut(userId: string, userRole: string, passId: string, rejectionNote?: string) {
-    const pass = await this.prisma.gateOutPass.findUnique({ where: { id: passId } });
+    const pass = await this.prisma.gateOutPass.findUnique({ where: { id: passId }, include: { warehouse: { select: { userId: true } } } });
     if (!pass) throw new NotFoundException('Gate-out request not found');
     const isAdmin = userRole === 'ADMIN' || userRole === 'MODERATOR';
     const isDepositor = pass.depositorId === userId;
     if (!isAdmin && !isDepositor) throw new ForbiddenException('Only the depositor or an admin can reject a gate-out request');
     if (pass.status !== 'PENDING') throw new BadRequestException(`This request has already been ${pass.status.toLowerCase()}`);
 
-    return this.prisma.gateOutPass.update({
+    const rejected = await this.prisma.gateOutPass.update({
       where: { id: passId },
       data: { status: 'REJECTED', approvedById: userId, approverRole: isAdmin ? 'ADMIN' : 'DEPOSITOR', approvedAt: new Date(), rejectionNote },
     });
+    await this.notifications.notify({
+      userId: pass.warehouse.userId,
+      type: NotificationType.WAREHOUSE_UPDATE,
+      title: 'Gate-out request rejected',
+      body: `The release request was rejected${rejectionNote ? `: ${rejectionNote}` : '.'}`,
+      data: { link: '/warehouse-portal', bookingId: pass.bookingId },
+    });
+    return rejected;
   }
 
   async getGateOutPass(userId: string, userRole: string, passId: string) {
@@ -967,33 +1167,53 @@ export class WarehouseService {
   async applyLien(ownerId: string, dto: ApplyLienDto) {
     const receipt = await this.prisma.warehouseReceipt.findUnique({
       where: { id: dto.receiptId },
-      include: { lien: true },
+      include: { lien: true, warehouse: { select: { userId: true, name: true } } },
     });
     if (!receipt) throw new NotFoundException('Receipt not found');
     if (receipt.ownerId !== ownerId) throw new ForbiddenException('Not your receipt');
     if (receipt.status !== ReceiptStatus.ACTIVE) throw new BadRequestException('Receipt must be Active to apply for a lien');
-    if (receipt.lien) throw new BadRequestException('A lien is already placed on this receipt');
+    if (receipt.lien && LIEN_BLOCKING_STATUSES.includes(receipt.lien.status)) {
+      throw new BadRequestException('A loan application or lien already exists on this receipt');
+    }
 
+    // Collateral value must come from the admin price table. 0 = no price
+    // was configured when the receipt was issued ("valuation pending").
+    if (!(Number(receipt.marketValue) > 0)) {
+      throw new BadRequestException(
+        `The collateral value of ${receipt.commodity} has not been set yet, so a loan cannot be assessed. An AgriConnect admin needs to set the commodity price — please try again later.`,
+      );
+    }
     const maxLoan = Number(receipt.marketValue) * 0.70;
     if (dto.loanAmount > maxLoan) {
       throw new BadRequestException(`Maximum eligible loan is ₨${maxLoan.toLocaleString()} (70% of commodity value)`);
     }
 
-    // Idempotency guard: atomically flip the receipt to UNDER_LIEN only if
-    // it is still ACTIVE. If two requests race (double-tap, retry), the
-    // second one's updateMany affects 0 rows and fails cleanly instead of
-    // creating two BankLien rows against the same collateral.
-    const guarded = await this.prisma.warehouseReceipt.updateMany({
-      where: { id: dto.receiptId, status: ReceiptStatus.ACTIVE },
-      data: { status: ReceiptStatus.UNDER_LIEN },
-    });
-    if (guarded.count === 0) {
-      throw new BadRequestException('This receipt is no longer available for a new lien application');
-    }
-
-    let lien;
-    try {
-      lien = await this.prisma.bankLien.create({
+    // One transaction: freeze the receipt (guarded, so a double-tap can't
+    // create two applications) and record the application as PENDING. No
+    // loan exists yet — nothing is booked in the ledger until an admin
+    // confirms it (see confirmLien).
+    const lien = await this.prisma.$transaction(async (tx) => {
+      const guarded = await tx.warehouseReceipt.updateMany({
+        where: { id: dto.receiptId, status: ReceiptStatus.ACTIVE },
+        data: { status: ReceiptStatus.UNDER_LIEN },
+      });
+      if (guarded.count === 0) {
+        throw new BadRequestException('This receipt is no longer available for a new lien application');
+      }
+      // A previous REJECTED / WITHDRAWN / RELEASED application occupies the
+      // unique receiptId slot — reuse that row for the new application.
+      if (receipt.lien) {
+        return tx.bankLien.update({
+          where: { id: receipt.lien.id },
+          data: {
+            bankName: dto.bankName, loanPurpose: dto.loanPurpose, loanAmount: dto.loanAmount,
+            interestRate: dto.interestRate, tenureMonths: dto.tenureMonths, loanOfficer: dto.loanOfficer,
+            status: LienStatus.PENDING, placedAt: new Date(), releasedAt: null, releaseNote: null,
+            loanRefNo: null, decidedById: null, decidedAt: null, decisionNote: null,
+          },
+        });
+      }
+      return tx.bankLien.create({
         data: {
           receiptId: dto.receiptId,
           bankName: dto.bankName,
@@ -1002,96 +1222,350 @@ export class WarehouseService {
           interestRate: dto.interestRate,
           tenureMonths: dto.tenureMonths,
           loanOfficer: dto.loanOfficer,
-          status: LienStatus.ACTIVE,
+          status: LienStatus.PENDING,
         },
       });
-    } catch (err) {
-      // Roll back the receipt status flip if lien creation somehow fails
-      // (e.g. unique constraint conflict) so the receipt isn't stuck
-      // permanently locked with no lien attached.
-      await this.prisma.warehouseReceipt.update({
-        where: { id: dto.receiptId },
-        data: { status: ReceiptStatus.ACTIVE },
-      });
-      throw err;
-    }
-
-    await this.prisma.transaction.create({
-      data: {
-        userId: ownerId,
-        type: TransactionType.LOAN_DISBURSEMENT,
-        amount: dto.loanAmount,
-        description: `Loan application submitted to ${dto.bankName} against receipt ${receipt.receiptNumber}`,
-        referenceId: lien.id,
-        referenceType: 'lien',
-      },
     });
+
+    // Notify: the warehouse (hold the goods), the owner (confirmation), and
+    // admins/moderators (there is an application waiting for a decision).
+    const [owner, reviewers] = await Promise.all([
+      this.prisma.user.findUnique({ where: { id: ownerId }, select: { profile: { select: { fullName: true, businessName: true } } } }),
+      this.prisma.user.findMany({ where: { role: { in: ['ADMIN', 'MODERATOR'] }, isActive: true }, select: { id: true } }),
+    ]);
+    const ownerName = owner?.profile?.businessName || owner?.profile?.fullName || 'The depositor';
+    await this.notifications.notifyMany([
+      {
+        userId: receipt.warehouse.userId,
+        type: NotificationType.LOAN_UPDATE,
+        title: 'Loan application on stored goods',
+        body: `${ownerName} applied for a ₨${dto.loanAmount.toLocaleString()} loan from ${dto.bankName} against receipt ${receipt.receiptNumber} (${receipt.commodity}, ${receipt.quantityTons} t). Do not release these goods — gate-out is blocked while the application is pending and while any lien is active.`,
+        data: { link: '/warehouse-portal', receiptId: receipt.id, lienId: lien.id },
+      },
+      {
+        userId: ownerId,
+        type: NotificationType.LOAN_UPDATE,
+        title: 'Loan application submitted',
+        body: `Your application for ₨${dto.loanAmount.toLocaleString()} from ${dto.bankName} against receipt ${receipt.receiptNumber} is awaiting confirmation. The goods are on hold at ${receipt.warehouse.name} until it is decided. You can withdraw it any time before confirmation.`,
+        data: { link: '/warehouse', receiptId: receipt.id, lienId: lien.id },
+      },
+      ...reviewers.map((r) => ({
+        userId: r.id,
+        type: NotificationType.LOAN_UPDATE,
+        title: 'Loan application awaiting confirmation',
+        body: `${ownerName} — ₨${dto.loanAmount.toLocaleString()} from ${dto.bankName} against receipt ${receipt.receiptNumber}.`,
+        data: { link: '/admin', lienId: lien.id },
+      })),
+    ]);
 
     return {
       lien,
-      message: 'Loan application submitted successfully.',
+      message: 'Loan application submitted. It becomes an active lien once AgriConnect confirms it with the bank.',
       nextSteps: [
-        `${dto.bankName} will contact you within 2–5 working days`,
-        'A bank officer will verify the warehouse receipt',
-        'Loan will be disbursed to your registered bank account',
-        'Lien will be released upon full loan repayment',
+        `${dto.bankName} / AgriConnect will review and confirm your application`,
+        'Your goods are on hold at the warehouse while it is pending',
+        'You can withdraw the application any time before it is confirmed',
+        'Once confirmed, the lien is active until the bank records clearance after repayment',
       ],
     };
   }
 
-  // ─── RELEASE LIEN ─────────────────────────────────────────────────────────
-  async releaseLien(lienId: string, userId: string, note?: string) {
+  // ─── DEPOSITOR WITHDRAWS A PENDING APPLICATION ────────────────────────────
+  async withdrawLien(lienId: string, ownerId: string) {
     const lien = await this.prisma.bankLien.findUnique({
       where: { id: lienId },
-      include: { receipt: true },
+      include: { receipt: { include: { warehouse: { select: { userId: true } } } } },
+    });
+    if (!lien) throw new NotFoundException('Application not found');
+    if (lien.receipt.ownerId !== ownerId) throw new ForbiddenException('Not your application');
+    if (lien.status !== LienStatus.PENDING) {
+      throw new BadRequestException(`Only a pending application can be withdrawn (this one is ${lien.status.toLowerCase()})`);
+    }
+
+    await this.prisma.$transaction(async (tx) => {
+      const res = await tx.bankLien.updateMany({
+        where: { id: lienId, status: LienStatus.PENDING },
+        data: { status: LienStatus.WITHDRAWN, decidedAt: new Date(), decisionNote: 'Withdrawn by depositor' },
+      });
+      if (res.count === 0) throw new BadRequestException('This application was just decided — refresh and check its status');
+      await tx.warehouseReceipt.updateMany({
+        where: { id: lien.receiptId, status: ReceiptStatus.UNDER_LIEN },
+        data: { status: ReceiptStatus.ACTIVE },
+      });
+    });
+
+    await this.notifications.notify({
+      userId: lien.receipt.warehouse.userId,
+      type: NotificationType.LOAN_UPDATE,
+      title: 'Loan application withdrawn',
+      body: `The loan application on receipt ${lien.receipt.receiptNumber} was withdrawn. The hold on these goods is lifted.`,
+      data: { link: '/warehouse-portal', receiptId: lien.receiptId },
+    });
+    return { message: 'Application withdrawn. Your goods are no longer on hold.' };
+  }
+
+  // ─── ADMIN: LIEN APPLICATIONS QUEUE ───────────────────────────────────────
+  async adminListLiens(status?: string) {
+    return this.prisma.bankLien.findMany({
+      where: status ? { status: status as LienStatus } : undefined,
+      include: {
+        receipt: {
+          select: {
+            id: true, receiptNumber: true, commodity: true, quantityTons: true, marketValue: true,
+            warehouse: { select: { name: true, city: true } },
+            owner: { select: { id: true, phoneNumber: true, profile: { select: { fullName: true, businessName: true } } } },
+          },
+        },
+      },
+      orderBy: { placedAt: 'desc' },
+    });
+  }
+
+  // ─── ADMIN / MODERATOR CONFIRMS A LIEN (acting for the bank) ──────────────
+  // Before this, a depositor's application became an ACTIVE lien — and a
+  // LOAN_DISBURSEMENT ledger row — instantly, with no bank involved.
+  async confirmLien(lienId: string, deciderId: string, dto: ConfirmLienDto) {
+    const lien = await this.prisma.bankLien.findUnique({
+      where: { id: lienId },
+      include: { receipt: { include: { warehouse: { select: { userId: true, name: true } } } } },
+    });
+    if (!lien) throw new NotFoundException('Application not found');
+    if (lien.status !== LienStatus.PENDING) {
+      throw new BadRequestException(`Only a pending application can be confirmed (this one is ${lien.status.toLowerCase()})`);
+    }
+    const ref = (dto.loanRefNo || '').trim();
+    if (ref.length < 3) throw new BadRequestException("Enter the bank's loan reference number");
+
+    await this.prisma.$transaction(async (tx) => {
+      const res = await tx.bankLien.updateMany({
+        where: { id: lienId, status: LienStatus.PENDING },
+        data: {
+          status: LienStatus.ACTIVE,
+          loanRefNo: ref,
+          ...(dto.interestRate !== undefined && { interestRate: dto.interestRate }),
+          decidedById: deciderId, decidedAt: new Date(), decisionNote: dto.note || null,
+        },
+      });
+      if (res.count === 0) throw new BadRequestException('This application was just decided — refresh and check its status');
+
+      // The loan is real now: book the disbursement.
+      await tx.transaction.create({
+        data: {
+          userId: lien.receipt.ownerId,
+          type: TransactionType.LOAN_DISBURSEMENT,
+          amount: lien.loanAmount,
+          description: `Loan confirmed by ${lien.bankName} (ref ${ref}) against receipt ${lien.receipt.receiptNumber}`,
+          referenceId: lien.id,
+          referenceType: 'lien',
+        },
+      });
+    });
+
+    await recordAudit(this.prisma, deciderId, 'lien_confirmed', 'lien', lienId, { loanRefNo: ref, amount: Number(lien.loanAmount) });
+    await this.notifications.notifyMany([
+      {
+        userId: lien.receipt.ownerId,
+        type: NotificationType.LOAN_UPDATE,
+        title: 'Loan confirmed — goods under bank lien',
+        body: `${lien.bankName} loan of ₨${Number(lien.loanAmount).toLocaleString()} confirmed (ref ${ref}). Receipt ${lien.receipt.receiptNumber} is now under bank lien until the bank records clearance.`,
+        data: { link: '/warehouse', receiptId: lien.receiptId },
+      },
+      {
+        userId: lien.receipt.warehouse.userId,
+        type: NotificationType.LOAN_UPDATE,
+        title: 'Bank lien is now active',
+        body: `The ${lien.bankName} lien on receipt ${lien.receipt.receiptNumber} is confirmed (ref ${ref}). Do not release these goods until the bank's clearance is recorded.`,
+        data: { link: '/warehouse-portal', receiptId: lien.receiptId },
+      },
+    ]);
+    return { message: 'Lien confirmed and activated.' };
+  }
+
+  // ─── ADMIN / MODERATOR DECLINES A LIEN APPLICATION ────────────────────────
+  async rejectLien(lienId: string, deciderId: string, note?: string) {
+    const lien = await this.prisma.bankLien.findUnique({
+      where: { id: lienId },
+      include: { receipt: { include: { warehouse: { select: { userId: true } } } } },
+    });
+    if (!lien) throw new NotFoundException('Application not found');
+    if (lien.status !== LienStatus.PENDING) {
+      throw new BadRequestException(`Only a pending application can be declined (this one is ${lien.status.toLowerCase()})`);
+    }
+    const reason = (note || '').trim();
+    if (reason.length < 5) throw new BadRequestException('Give the depositor a reason for declining (at least 5 characters)');
+
+    await this.prisma.$transaction(async (tx) => {
+      const res = await tx.bankLien.updateMany({
+        where: { id: lienId, status: LienStatus.PENDING },
+        data: { status: LienStatus.REJECTED, decidedById: deciderId, decidedAt: new Date(), decisionNote: reason },
+      });
+      if (res.count === 0) throw new BadRequestException('This application was just decided — refresh and check its status');
+      await tx.warehouseReceipt.updateMany({
+        where: { id: lien.receiptId, status: ReceiptStatus.UNDER_LIEN },
+        data: { status: ReceiptStatus.ACTIVE },
+      });
+    });
+
+    await recordAudit(this.prisma, deciderId, 'lien_rejected', 'lien', lienId, { reason });
+    await this.notifications.notifyMany([
+      {
+        userId: lien.receipt.ownerId,
+        type: NotificationType.LOAN_UPDATE,
+        title: 'Loan application declined',
+        body: `Your ${lien.bankName} application on receipt ${lien.receipt.receiptNumber} was declined: ${reason}. Your goods are no longer on hold.`,
+        data: { link: '/warehouse', receiptId: lien.receiptId },
+      },
+      {
+        userId: lien.receipt.warehouse.userId,
+        type: NotificationType.LOAN_UPDATE,
+        title: 'Loan application declined',
+        body: `The loan application on receipt ${lien.receipt.receiptNumber} was declined. The hold on these goods is lifted.`,
+        data: { link: '/warehouse-portal', receiptId: lien.receiptId },
+      },
+    ]);
+    return { message: 'Application declined. The goods are released from hold.' };
+  }
+
+  // ─── RECORD BANK CLEARANCE / RELEASE LIEN ─────────────────────────────────
+  // Only the warehouse holding the goods (which receives the bank's release
+  // letter) or an AgriConnect admin/moderator may record that the bank has
+  // cleared the lien. The depositor deliberately cannot: they would be
+  // clearing their own collateral, which defeats the point of the lien.
+  async releaseLien(lienId: string, userId: string, userRole: string, note?: string) {
+    const lien = await this.prisma.bankLien.findUnique({
+      where: { id: lienId },
+      include: { receipt: { include: { warehouse: { select: { userId: true, name: true } } } } },
     });
     if (!lien) throw new NotFoundException('Lien not found');
-    if (lien.receipt.ownerId !== userId) throw new ForbiddenException('Not your lien');
+    const isAdmin = userRole === 'ADMIN' || userRole === 'MODERATOR';
+    const isOperator = lien.receipt.warehouse.userId === userId;
+    if (!isAdmin && !isOperator) {
+      throw new ForbiddenException('Only the warehouse or an AgriConnect admin can record the bank\'s clearance of a lien');
+    }
+    if (lien.status !== LienStatus.ACTIVE) throw new BadRequestException(`This lien is already ${lien.status.toLowerCase()}`);
+    const reference = (note || '').trim();
+    if (!reference) throw new BadRequestException('Enter the bank\'s clearance reference (release letter / reference number)');
 
-    await this.prisma.$transaction([
-      this.prisma.bankLien.update({
-        where: { id: lienId },
-        data: { status: LienStatus.RELEASED, releasedAt: new Date(), releaseNote: note },
-      }),
-      this.prisma.warehouseReceipt.update({
+    // Guarded on the status we validated, in one transaction: two simultaneous
+    // clearances (double-click, two admins) can only succeed once, so the
+    // repayment is booked exactly once.
+    await this.prisma.$transaction(async (tx) => {
+      const res = await tx.bankLien.updateMany({
+        where: { id: lienId, status: LienStatus.ACTIVE },
+        data: { status: LienStatus.RELEASED, releasedAt: new Date(), releaseNote: reference },
+      });
+      if (res.count === 0) throw new BadRequestException('This lien was just cleared — refresh and check its status');
+      await tx.warehouseReceipt.update({
         where: { id: lien.receiptId },
         data: { status: ReceiptStatus.ACTIVE },
-      }),
+      });
+      // Clearance means the bank has been repaid: book the repayment.
+      await tx.transaction.create({
+        data: {
+          userId: lien.receipt.ownerId,
+          type: TransactionType.LOAN_REPAYMENT,
+          amount: lien.loanAmount,
+          description: `Loan cleared by ${lien.bankName} (ref ${reference}) on receipt ${lien.receipt.receiptNumber}`,
+          referenceId: lien.id,
+          referenceType: 'lien',
+        },
+      });
+    });
+
+    await this.notifications.notifyMany([
+      {
+        userId: lien.receipt.ownerId,
+        type: NotificationType.LOAN_UPDATE,
+        title: 'Bank lien cleared',
+        body: `${lien.bankName} has cleared the lien on receipt ${lien.receipt.receiptNumber} (ref: ${reference}). Your goods are free to be released.`,
+        data: { link: '/warehouse', receiptId: lien.receiptId },
+      },
+      {
+        userId: lien.receipt.warehouse.userId,
+        type: NotificationType.LOAN_UPDATE,
+        title: 'Bank lien cleared',
+        body: `Clearance recorded for receipt ${lien.receipt.receiptNumber} (${lien.bankName}, ref: ${reference}). Gate-out can now be requested.`,
+        data: { link: '/warehouse-portal', receiptId: lien.receiptId },
+      },
     ]);
 
-    return { message: 'Lien released. Receipt is now fully in your control.' };
+    return { message: 'Bank clearance recorded. The lien is released and gate-out is unblocked.' };
   }
 
   // ─── BUY INSURANCE ────────────────────────────────────────────────────────
-  async buyInsurance(ownerId: string, dto: BuyInsuranceDto) {
+  // The premium is the warehouse's own rate (per ton per month) × the stored
+  // quantity × the months left on the receipt; cover is the receipt's value.
+  // Nothing about price, insurer or cover comes from the client any more
+  // (it used to accept a made-up insurer and any premium the browser sent).
+  async quoteInsurance(receipt: { quantityTons: number; marketValue: any; expiryDate: Date; commodity: string; warehouse: { name: string; insuranceAvailable: boolean; insurancePricePerTonMonth: any } }) {
+    const rate = Number(receipt.warehouse.insurancePricePerTonMonth || 0);
+    if (!receipt.warehouse.insuranceAvailable || !(rate > 0)) {
+      throw new BadRequestException('This warehouse has not priced storage insurance yet, so cover cannot be bought for this receipt.');
+    }
+    const coverageAmount = Number(receipt.marketValue);
+    if (!(coverageAmount > 0)) {
+      throw new BadRequestException('The value of these goods has not been set yet (valuation pending), so cover cannot be quoted. Please try again later.');
+    }
+    const msLeft = receipt.expiryDate.getTime() - Date.now();
+    const months = Math.max(1, Math.ceil(msLeft / (30 * 24 * 60 * 60 * 1000)));
+    const premiumAmount = Math.round(rate * receipt.quantityTons * months * 100) / 100;
+    return { rate, months, coverageAmount, premiumAmount, provider: receipt.warehouse.name };
+  }
+
+  async getInsuranceQuote(ownerId: string, receiptId: string) {
     const receipt = await this.prisma.warehouseReceipt.findUnique({
-      where: { id: dto.receiptId },
-      include: { insurance: true },
+      where: { id: receiptId },
+      include: { insurance: true, warehouse: { select: { name: true, insuranceAvailable: true, insurancePricePerTonMonth: true } } },
     });
     if (!receipt) throw new NotFoundException('Receipt not found');
     if (receipt.ownerId !== ownerId) throw new ForbiddenException('Not your receipt');
     if (receipt.insurance) throw new BadRequestException('Insurance already active on this receipt');
+    return this.quoteInsurance(receipt as any);
+  }
 
-    const policyNumber = `${dto.provider.slice(0, 3).toUpperCase()}-AGR-${new Date().getFullYear()}-${Math.floor(Math.random() * 9000 + 1000)}`;
-
-    const insurance = await this.prisma.storageInsurance.create({
-      data: {
-        receiptId: dto.receiptId,
-        provider: dto.provider,
-        planName: dto.planName,
-        policyNumber,
-        coverageAmount: dto.coverageAmount,
-        premiumAmount: dto.premiumAmount,
-        coverage: dto.coverage,
-        startDate: new Date(),
-        endDate: receipt.expiryDate,
-        status: 'active',
-      },
+  async buyInsurance(ownerId: string, dto: BuyInsuranceDto) {
+    const receipt = await this.prisma.warehouseReceipt.findUnique({
+      where: { id: dto.receiptId },
+      include: { insurance: true, warehouse: { select: { name: true, insuranceAvailable: true, insurancePricePerTonMonth: true } } },
     });
+    if (!receipt) throw new NotFoundException('Receipt not found');
+    if (receipt.ownerId !== ownerId) throw new ForbiddenException('Not your receipt');
+    if (receipt.insurance) throw new BadRequestException('Insurance already active on this receipt');
+    const quote = await this.quoteInsurance(receipt as any);
+
+    // Policy numbers come from a native sequence (policySeq) instead of a
+    // 4-digit Math.random(), which could collide.
+    const prefix = quote.provider.replace(/[^A-Za-z]/g, '').slice(0, 3).toUpperCase() || 'POL';
+    let insurance;
+    try {
+      insurance = await this.prisma.$transaction(async (tx) => {
+        const holder = await tx.storageInsurance.create({
+          data: {
+            receiptId: dto.receiptId,
+            provider: quote.provider,
+            planName: 'Storage cover',
+            policyNumber: `TMP-${uuidv4()}`,
+            coverageAmount: quote.coverageAmount,
+            premiumAmount: quote.premiumAmount,
+            coverage: "As per the warehouse's storage insurance terms",
+            startDate: new Date(),
+            endDate: receipt.expiryDate,
+            status: 'active',
+          },
+        });
+        return tx.storageInsurance.update({
+          where: { id: holder.id },
+          data: { policyNumber: `${prefix}-AGR-${new Date().getFullYear()}-${String(holder.policySeq).padStart(6, '0')}` },
+        });
+      });
+    } catch (e: any) {
+      if (e?.code === 'P2002') throw new BadRequestException('Insurance already active on this receipt');
+      throw e;
+    }
 
     return {
       insurance,
-      message: `Insurance policy activated. Policy No: ${policyNumber}`,
+      message: `Insurance policy activated. Policy No: ${insurance.policyNumber}`,
     };
   }
 
@@ -1136,6 +1610,7 @@ export class WarehouseService {
           // properly instead of seeing just a name and city.
           depositor: { select: { id: true, phoneNumber: true, email: true, kycStatus: true, profile: { select: { fullName: true, businessName: true, city: true, province: true } } } },
           _count: { select: { messages: true } },
+          receipt: { select: { id: true, receiptNumber: true, status: true, lien: { select: { id: true, bankName: true, loanAmount: true, status: true, placedAt: true } } } },
           // Document state per booking (NEW_Changes item 10) so the
           // dashboard can show invoice/GRN/gate-pass status inline
           // without extra round trips.
@@ -1196,7 +1671,7 @@ export class WarehouseService {
 
   // Admin: mark a warehouse as verified/unverified — a trust signal shown
   // to buyers, separate from isActive (listed/delisted).
-  async adminVerify(warehouseId: string, verified: boolean) {
+  async adminVerify(warehouseId: string, verified: boolean, actorId?: string) {
     // Guard added Round 2, Milestone 6 for consistency with
     // adminSetActive just below (and with the equivalent TestingService/
     // TransportService methods this pattern was just copied to) — a
@@ -1204,18 +1679,22 @@ export class WarehouseService {
     // "record to update not found" error instead of a clean 404.
     const warehouse = await this.prisma.warehouseProfile.findUnique({ where: { id: warehouseId } });
     if (!warehouse) throw new NotFoundException('Warehouse not found');
-    return this.prisma.warehouseProfile.update({
+    const res = await this.prisma.warehouseProfile.update({
       where: { id: warehouseId },
       data: { isVerified: verified },
     });
+    await recordAudit(this.prisma, actorId, verified ? 'warehouse_verified' : 'warehouse_unverified', 'warehouse', warehouseId);
+    return res;
   }
 
   // "Delist" a warehouse — hides it from public browsing without touching
   // the underlying user account (an admin might want to hide a listing
   // while still letting the operator log in to fix something).
-  async adminSetActive(warehouseId: string, isActive: boolean) {
+  async adminSetActive(warehouseId: string, isActive: boolean, actorId?: string) {
     const warehouse = await this.prisma.warehouseProfile.findUnique({ where: { id: warehouseId } });
     if (!warehouse) throw new NotFoundException('Warehouse not found');
-    return this.prisma.warehouseProfile.update({ where: { id: warehouseId }, data: { isActive } });
+    const res = await this.prisma.warehouseProfile.update({ where: { id: warehouseId }, data: { isActive } });
+    await recordAudit(this.prisma, actorId, isActive ? 'warehouse_relisted' : 'warehouse_delisted', 'warehouse', warehouseId);
+    return res;
   }
 }

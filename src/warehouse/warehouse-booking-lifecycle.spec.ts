@@ -3,6 +3,8 @@ import { BadRequestException, ForbiddenException, NotFoundException } from '@nes
 import { WarehouseService } from './warehouse.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../common/storage/storage.service';
+import { NotificationsService } from '../notifications/notifications.service';
+import { SettingsService } from '../settings/settings.service';
 import { BookingStatus, ReceiptStatus, LienStatus } from '@prisma/client';
 
 // Stub — the booking lifecycle transitions covered here don't touch
@@ -14,6 +16,10 @@ const storageStub = {
   getPresignedUrl: jest.fn(),
   deleteObject: jest.fn(),
 };
+
+// Notifications are best-effort side effects; most tests only care that they
+// don't break the action. Specific tests assert on `notificationsStub.notify*`.
+const notificationsStub = { notify: jest.fn().mockResolvedValue(undefined), notifyMany: jest.fn().mockResolvedValue(undefined) };
 
 /**
  * Round 2, Milestone 2 — warehouse booking state machine.
@@ -51,11 +57,15 @@ describe('WarehouseService — booking lifecycle', () => {
       warehouseReceipt: {
         update: jest.fn().mockResolvedValue({}),
       },
-      $transaction: jest.fn().mockImplementation((ops) => Promise.all(ops)),
+      warehouseInvoice: { findUnique: jest.fn().mockResolvedValue(null) },
+      gateOutPass: { findFirst: jest.fn().mockResolvedValue({ id: 'pass-1' }) },
+      transaction: { create: jest.fn().mockResolvedValue({}) },
+      // Supports both the array form and the interactive (callback) form.
+      $transaction: jest.fn().mockImplementation((arg) => (typeof arg === 'function' ? arg(prisma) : Promise.all(arg))),
     };
 
     const moduleRef = await Test.createTestingModule({
-      providers: [WarehouseService, { provide: PrismaService, useValue: prisma }, { provide: StorageService, useValue: storageStub }],
+      providers: [WarehouseService, { provide: PrismaService, useValue: prisma }, { provide: StorageService, useValue: storageStub }, { provide: NotificationsService, useValue: notificationsStub }, { provide: SettingsService, useValue: { getCommodityPricePerTon: jest.fn().mockResolvedValue(38000), getPlatformFeePct: jest.fn().mockResolvedValue(1.5) } }],
     }).compile();
 
     service = moduleRef.get(WarehouseService);
@@ -101,6 +111,11 @@ describe('WarehouseService — booking lifecycle', () => {
       );
     });
 
+    it('writes no refund when nothing was paid', async () => {
+      await service.rejectBooking('operator-1', 'booking-1', dto);
+      expect(prisma.transaction.create).not.toHaveBeenCalled();
+    });
+
     it('cannot reject a booking that is already ACTIVE', async () => {
       prisma.storageBooking.findUnique.mockResolvedValue({ ...baseBooking, status: BookingStatus.ACTIVE });
       await expect(service.rejectBooking('operator-1', 'booking-1', dto)).rejects.toThrow(BadRequestException);
@@ -125,6 +140,23 @@ describe('WarehouseService — booking lifecycle', () => {
     it('cannot cancel a COMPLETED booking', async () => {
       prisma.storageBooking.findUnique.mockResolvedValue({ ...baseBooking, status: BookingStatus.COMPLETED });
       await expect(service.cancelBooking('buyer-1', 'BUYER', 'booking-1', {})).rejects.toThrow(BadRequestException);
+    });
+
+    it('books a REFUND when a booking is cancelled after its invoice was PAID', async () => {
+      prisma.storageBooking.findUnique.mockResolvedValue({ ...baseBooking, status: BookingStatus.ACCEPTED });
+      prisma.warehouseInvoice.findUnique.mockResolvedValue({ status: 'PAID', totalAmount: 125000, invoiceNumber: 'INV-2026-000007' });
+      await service.cancelBooking('buyer-1', 'BUYER', 'booking-1', {});
+      expect(prisma.transaction.create).toHaveBeenCalledTimes(1);
+      expect(prisma.transaction.create.mock.calls[0][0].data).toMatchObject({
+        userId: 'buyer-1', type: 'REFUND', amount: 125000, referenceId: 'booking-1', referenceType: 'storage',
+      });
+    });
+
+    it('books no refund when the invoice was never paid', async () => {
+      prisma.storageBooking.findUnique.mockResolvedValue({ ...baseBooking, status: BookingStatus.ACCEPTED });
+      prisma.warehouseInvoice.findUnique.mockResolvedValue({ status: 'UNPAID', totalAmount: 125000 });
+      await service.cancelBooking('buyer-1', 'BUYER', 'booking-1', {});
+      expect(prisma.transaction.create).not.toHaveBeenCalled();
     });
 
     it('can cancel an ACCEPTED booking (before goods arrive)', async () => {
@@ -160,6 +192,13 @@ describe('WarehouseService — booking lifecycle', () => {
       await expect(service.completeBooking('operator-1', 'booking-1')).rejects.toThrow(
         /active bank lien/,
       );
+    });
+
+    it('refuses to complete without an APPROVED gate-out pass', async () => {
+      prisma.storageBooking.findUnique.mockResolvedValue({ ...baseBooking, status: BookingStatus.ACTIVE, receipt: null });
+      prisma.gateOutPass.findFirst.mockResolvedValue(null);
+      await expect(service.completeBooking('operator-1', 'booking-1')).rejects.toThrow(/approved gate-out pass/);
+      expect(prisma.gateOutPass.findFirst).toHaveBeenCalledWith(expect.objectContaining({ where: { bookingId: 'booking-1', status: 'APPROVED' } }));
     });
 
     it('cannot complete a booking that is still REQUESTED', async () => {

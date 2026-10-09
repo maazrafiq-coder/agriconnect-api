@@ -3,10 +3,11 @@ import {
 } from '@nestjs/common';
 import {
   WarehouseService, CreateWarehouseDto, UpdateWarehouseDto, BookStorageDto,
-  WarehouseQueryDto, ApplyLienDto, BuyInsuranceDto,
+  WarehouseQueryDto, ApplyLienDto, ConfirmLienDto, BuyInsuranceDto,
   RejectBookingDto, CancelBookingDto, PostBookingMessageDto,
 } from './warehouse.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { RequireApproved } from '../common/guards/approved-user.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
@@ -33,14 +34,14 @@ export class WarehouseController {
 
   // POST /warehouse/register — warehouse operator registers
   @Post('register')
-  @UseGuards(JwtAuthGuard)
+  @RequireApproved()
   register(@CurrentUser('id') userId: string, @Body() dto: CreateWarehouseDto) {
     return this.warehouseService.create(userId, dto);
   }
 
   // PATCH /warehouse/:id — operator edits their own warehouse's details/rates
   @Patch(':id')
-  @UseGuards(JwtAuthGuard)
+  @RequireApproved()
   update(@Param('id') id: string, @CurrentUser('id') userId: string, @Body() dto: UpdateWarehouseDto) {
     return this.warehouseService.update(userId, id, dto);
   }
@@ -62,7 +63,7 @@ export class WarehouseController {
   // POST /warehouse/book — book storage (creates a REQUESTED booking;
   // the warehouse operator must accept it before goods should be delivered)
   @Post('book')
-  @UseGuards(JwtAuthGuard)
+  @RequireApproved()
   book(@CurrentUser('id') userId: string, @Body() dto: BookStorageDto) {
     return this.warehouseService.bookStorage(userId, dto);
   }
@@ -102,21 +103,21 @@ export class WarehouseController {
 
   // PATCH /warehouse/bookings/:id/accept — warehouse operator accepts a REQUESTED booking
   @Patch('bookings/:id/accept')
-  @UseGuards(JwtAuthGuard)
+  @RequireApproved()
   acceptBooking(@Param('id') id: string, @CurrentUser('id') userId: string) {
     return this.warehouseService.acceptBooking(userId, id);
   }
 
   // PATCH /warehouse/bookings/:id/reject — warehouse operator declines a REQUESTED booking
   @Patch('bookings/:id/reject')
-  @UseGuards(JwtAuthGuard)
+  @RequireApproved()
   rejectBooking(@Param('id') id: string, @CurrentUser('id') userId: string, @Body() dto: RejectBookingDto) {
     return this.warehouseService.rejectBooking(userId, id, dto);
   }
 
   // PATCH /warehouse/bookings/:id/cancel — depositor or operator withdraws before goods arrive
   @Patch('bookings/:id/cancel')
-  @UseGuards(JwtAuthGuard)
+  @RequireApproved()
   cancelBooking(
     @Param('id') id: string,
     @CurrentUser('id') userId: string,
@@ -128,7 +129,7 @@ export class WarehouseController {
 
   // PATCH /warehouse/bookings/:id/complete — operator marks booking complete (goods released)
   @Patch('bookings/:id/complete')
-  @UseGuards(JwtAuthGuard)
+  @RequireApproved()
   completeBooking(@Param('id') id: string, @CurrentUser('id') userId: string) {
     return this.warehouseService.completeBooking(userId, id);
   }
@@ -149,7 +150,7 @@ export class WarehouseController {
 
   // POST /warehouse/receipts/issue/:bookingId — operator issues receipt
   @Post('receipts/issue/:bookingId')
-  @UseGuards(JwtAuthGuard)
+  @RequireApproved()
   issueReceipt(
     @Param('bookingId') bookingId: string,
     @CurrentUser('id') userId: string,
@@ -163,7 +164,7 @@ export class WarehouseController {
 
   // POST /warehouse/bookings/:bookingId/invoice — operator generates & "sends" an invoice
   @Post('bookings/:bookingId/invoice')
-  @UseGuards(JwtAuthGuard)
+  @RequireApproved()
   generateInvoice(@Param('bookingId') bookingId: string, @CurrentUser('id') userId: string) {
     return this.warehouseService.generateInvoice(userId, bookingId);
   }
@@ -192,7 +193,7 @@ export class WarehouseController {
   // PATCH /warehouse/invoices/:id/confirm-payment — manual payment confirmation
   // (operator or admin/moderator — see InvoiceStatus schema comment)
   @Patch('invoices/:id/confirm-payment')
-  @UseGuards(JwtAuthGuard)
+  @RequireApproved()
   confirmInvoicePayment(
     @Param('id') id: string,
     @CurrentUser('id') userId: string,
@@ -215,7 +216,7 @@ export class WarehouseController {
 
   // POST /warehouse/bookings/:bookingId/gate-out-request — operator requests release
   @Post('bookings/:bookingId/gate-out-request')
-  @UseGuards(JwtAuthGuard)
+  @RequireApproved()
   requestGateOut(
     @Param('bookingId') bookingId: string,
     @CurrentUser('id') userId: string,
@@ -248,14 +249,14 @@ export class WarehouseController {
 
   // PATCH /warehouse/gate-out/:id/approve — depositor or admin/moderator approves
   @Patch('gate-out/:id/approve')
-  @UseGuards(JwtAuthGuard)
+  @RequireApproved()
   approveGateOut(@Param('id') id: string, @CurrentUser('id') userId: string, @CurrentUser('role') userRole: string) {
     return this.warehouseService.approveGateOut(userId, userRole, id);
   }
 
   // PATCH /warehouse/gate-out/:id/reject — depositor or admin/moderator rejects
   @Patch('gate-out/:id/reject')
-  @UseGuards(JwtAuthGuard)
+  @RequireApproved()
   rejectGateOut(
     @Param('id') id: string,
     @CurrentUser('id') userId: string,
@@ -267,25 +268,42 @@ export class WarehouseController {
 
   // POST /warehouse/lien/apply — apply for bank lien
   @Post('lien/apply')
-  @UseGuards(JwtAuthGuard)
+  @RequireApproved()
   applyLien(@CurrentUser('id') userId: string, @Body() dto: ApplyLienDto) {
     return this.warehouseService.applyLien(userId, dto);
   }
 
-  // PATCH /warehouse/lien/:id/release — release bank lien
+  // PATCH /warehouse/lien/:id/withdraw — depositor withdraws a PENDING application
+  @Patch('lien/:id/withdraw')
+  @RequireApproved()
+  withdrawLien(@Param('id') id: string, @CurrentUser('id') userId: string) {
+    return this.warehouseService.withdrawLien(id, userId);
+  }
+
+  // PATCH /warehouse/lien/:id/release — record the bank's clearance of a lien.
+  // Warehouse operator (who receives the bank's release letter) or admin/
+  // moderator only; the depositor cannot clear their own lien.
   @Patch('lien/:id/release')
-  @UseGuards(JwtAuthGuard)
+  @RequireApproved()
   releaseLien(
     @Param('id') id: string,
     @CurrentUser('id') userId: string,
+    @CurrentUser('role') role: string,
     @Body('note') note?: string,
   ) {
-    return this.warehouseService.releaseLien(id, userId, note);
+    return this.warehouseService.releaseLien(id, userId, role, note);
+  }
+
+  // GET /warehouse/insurance/quote/:receiptId — server-computed premium & cover
+  @Get('insurance/quote/:receiptId')
+  @UseGuards(JwtAuthGuard)
+  insuranceQuote(@Param('receiptId') receiptId: string, @CurrentUser('id') userId: string) {
+    return this.warehouseService.getInsuranceQuote(userId, receiptId);
   }
 
   // POST /warehouse/insurance/buy — buy storage insurance
   @Post('insurance/buy')
-  @UseGuards(JwtAuthGuard)
+  @RequireApproved()
   buyInsurance(@CurrentUser('id') userId: string, @Body() dto: BuyInsuranceDto) {
     return this.warehouseService.buyInsurance(userId, dto);
   }
@@ -311,19 +329,43 @@ export class WarehouseController {
     return this.warehouseService.adminGetAll();
   }
 
+  // GET /warehouse/admin/liens?status=PENDING — loan application queue
+  @Get('admin/liens')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('ADMIN', 'MODERATOR')
+  adminListLiens(@Query('status') status?: string) {
+    return this.warehouseService.adminListLiens(status);
+  }
+
+  // PATCH /warehouse/admin/liens/:id/confirm — confirm a pending application (becomes the active lien)
+  @Patch('admin/liens/:id/confirm')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('ADMIN', 'MODERATOR')
+  confirmLien(@Param('id') id: string, @CurrentUser('id') userId: string, @Body() dto: ConfirmLienDto) {
+    return this.warehouseService.confirmLien(id, userId, dto);
+  }
+
+  // PATCH /warehouse/admin/liens/:id/reject — decline a pending application
+  @Patch('admin/liens/:id/reject')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('ADMIN', 'MODERATOR')
+  rejectLien(@Param('id') id: string, @CurrentUser('id') userId: string, @Body('note') note?: string) {
+    return this.warehouseService.rejectLien(id, userId, note);
+  }
+
   // PATCH /warehouse/admin/:id/verify
   @Patch('admin/:id/verify')
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles('ADMIN')
-  adminVerify(@Param('id') id: string, @Body('verified') verified: boolean) {
-    return this.warehouseService.adminVerify(id, verified);
+  adminVerify(@Param('id') id: string, @Body('verified') verified: boolean, @CurrentUser('id') adminId: string) {
+    return this.warehouseService.adminVerify(id, verified, adminId);
   }
 
   // PATCH /warehouse/admin/:id/active — delist/relist without touching the account
   @Patch('admin/:id/active')
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles('ADMIN')
-  adminSetActive(@Param('id') id: string, @Body('isActive') isActive: boolean) {
-    return this.warehouseService.adminSetActive(id, isActive);
+  adminSetActive(@Param('id') id: string, @Body('isActive') isActive: boolean, @CurrentUser('id') adminId: string) {
+    return this.warehouseService.adminSetActive(id, isActive, adminId);
   }
 }

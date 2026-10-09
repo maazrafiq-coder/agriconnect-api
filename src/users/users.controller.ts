@@ -45,7 +45,7 @@ export class UsersController {
   // GET /users/admin/list
   @Get('admin/list')
   @UseGuards(JwtAuthGuard, RolesGuard)
-  @Roles('ADMIN')
+  @Roles('ADMIN', 'MODERATOR') // moderators review registrations (read-only); only ADMIN decides
   adminList(
     @Query('role') role?: string,
     @Query('kycStatus') kycStatus?: string,
@@ -53,7 +53,7 @@ export class UsersController {
     @Query('page') page = 1,
     @Query('limit') limit = 20,
   ) {
-    return this.usersService.adminFindAll(role, kycStatus, search, +page, +limit);
+    return this.usersService.adminFindAll(role, kycStatus, search, +page, Math.min(Math.max(+limit || 20, 1), 200));
   }
 
   // GET /users/admin/:id/detail — full profile for the "View Complete
@@ -62,7 +62,7 @@ export class UsersController {
   // regardless of declaration order.
   @Get('admin/:id/detail')
   @UseGuards(JwtAuthGuard, RolesGuard)
-  @Roles('ADMIN')
+  @Roles('ADMIN', 'MODERATOR') // moderators review registrations (read-only); only ADMIN decides
   adminDetail(@Param('id') id: string) {
     return this.usersService.adminFindOne(id);
   }
@@ -92,14 +92,14 @@ export class UsersController {
         requestMessage: note.trim(),
       });
     }
-    return this.usersService.adminUpdateKyc(id, status, note);
+    return this.usersService.adminUpdateKyc(id, status, note, adminId);
   }
 
   // PATCH /users/admin/:id/active — suspend or activate
   @Patch('admin/:id/active')
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles('ADMIN')
-  adminSetActive(@Param('id') id: string, @Body('isActive') isActive: boolean) {
-    return this.usersService.adminSetActive(id, isActive);
+  adminSetActive(@Param('id') id: string, @Body('isActive') isActive: boolean, @CurrentUser('id') adminId: string) {
+    return this.usersService.adminSetActive(id, isActive, adminId);
   }
 }

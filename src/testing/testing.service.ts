@@ -1,8 +1,11 @@
 // ─── TESTING SERVICE ──────────────────────────────────────────────────────────
 import { Injectable, NotFoundException, ForbiddenException, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { TestingStatus, PaymentStatus } from '@prisma/client';
-import { IsString, IsNumber, IsOptional, IsArray, IsDateString, IsBoolean, Min } from 'class-validator';
+import { TestingStatus, PaymentStatus, NotificationType } from '@prisma/client';
+import { recordAudit } from '../common/utils/audit.util';
+import { NotificationsService } from '../notifications/notifications.service';
+import { IsString, IsNumber, IsOptional, IsArray, IsDateString, IsBoolean, IsIn, IsPositive, MinLength, Min } from 'class-validator';
+import { StorageService } from '../common/storage/storage.service';
 
 export class CreateTestingRequestDto {
   @IsString() agencyId: string;
@@ -15,8 +18,10 @@ export class CreateTestingRequestDto {
 }
 
 export class SubmitReportDto {
-  @IsString() reportUrl: string;
-  reportData: any;
+  // A report is a file uploaded earlier (POST …/report-file), a link, or
+  // structured results — at least one is required (checked in the service).
+  @IsOptional() @IsString() reportUrl?: string;
+  @IsOptional() reportData?: any;
 }
 
 export class AgencyQueryDto {
@@ -82,13 +87,15 @@ const TESTING_TRANSITIONS: Record<TestingStatus, { to: TestingStatus; allowedPar
 
 @Injectable()
 export class TestingService {
-  constructor(private prisma: PrismaService) {}
+  constructor(private prisma: PrismaService, private notifications: NotificationsService, private storage: StorageService) {}
 
   // Admin: delist a testing agency without touching the underlying account
-  async adminSetActive(agencyId: string, isActive: boolean) {
+  async adminSetActive(agencyId: string, isActive: boolean, actorId?: string) {
     const agency = await this.prisma.testingAgencyProfile.findUnique({ where: { id: agencyId } });
     if (!agency) throw new NotFoundException('Testing agency not found');
-    return this.prisma.testingAgencyProfile.update({ where: { id: agencyId }, data: { isActive } });
+    const res = await this.prisma.testingAgencyProfile.update({ where: { id: agencyId }, data: { isActive } });
+    await recordAudit(this.prisma, actorId, isActive ? 'testing_agency_relisted' : 'testing_agency_delisted', 'testing_agency', agencyId);
+    return res;
   }
 
   // Admin: mark a testing agency as verified/unverified — a trust signal
@@ -98,10 +105,12 @@ export class TestingService {
   // TransportService, despite TestingAgencyProfile/TransportProfile
   // both already having an `isVerified` column (used in this file's own
   // findAllAgencies sort order below) with no way to ever set it true.
-  async adminVerify(agencyId: string, verified: boolean) {
+  async adminVerify(agencyId: string, verified: boolean, actorId?: string) {
     const agency = await this.prisma.testingAgencyProfile.findUnique({ where: { id: agencyId } });
     if (!agency) throw new NotFoundException('Testing agency not found');
-    return this.prisma.testingAgencyProfile.update({ where: { id: agencyId }, data: { isVerified: verified } });
+    const res = await this.prisma.testingAgencyProfile.update({ where: { id: agencyId }, data: { isVerified: verified } });
+    await recordAudit(this.prisma, actorId, verified ? 'testing_agency_verified' : 'testing_agency_unverified', 'testing_agency', agencyId);
+    return res;
   }
 
   // Admin: see ALL agencies including delisted ones (the public findAllAgencies
@@ -245,15 +254,65 @@ export class TestingService {
       throw new BadRequestException('A report has already been submitted for this request');
     }
 
-    return this.prisma.testingRequest.update({
+    const hasReport = !!(dto.reportUrl?.trim() || request.reportFileKey || (dto.reportData && Object.keys(dto.reportData).length));
+    if (!hasReport) {
+      throw new BadRequestException('Attach the report file (or enter the results) before submitting');
+    }
+
+    const done = await this.prisma.testingRequest.update({
       where: { id: requestId },
       data: {
-        reportUrl: dto.reportUrl,
+        reportUrl: dto.reportUrl?.trim() || undefined,
         reportData: dto.reportData,
         status: TestingStatus.COMPLETED,
         completedAt: new Date(),
       },
     });
+    await this.notifications.notify({
+      userId: request.requesterId,
+      type: NotificationType.TESTING_UPDATE,
+      title: 'Your test report is ready',
+      body: 'The testing agency has submitted the report for your request.',
+      data: { link: '/buyer', requestId },
+    });
+    return done;
+  }
+
+  // The agency uploads the report document. It is stored under a permanent
+  // key; downloads get a freshly signed link every time (the previous flow
+  // had the agency paste a temporary link that expired after an hour).
+  async uploadReportFile(requestId: string, agencyId: string, file: { filename?: string; originalname?: string } | undefined) {
+    if (!file?.filename) throw new BadRequestException('Attach a PDF or image file');
+    const request = await this.prisma.testingRequest.findUnique({ where: { id: requestId } });
+    if (!request) throw new NotFoundException('Request not found');
+    if (request.agencyId !== agencyId) throw new ForbiddenException('Not your request');
+    if (request.status === TestingStatus.CANCELLED) {
+      throw new BadRequestException('This request was cancelled');
+    }
+    // Reports are final once submitted — replacing the file after the
+    // requester was told it is ready would silently change their evidence.
+    if (request.status === TestingStatus.COMPLETED) {
+      throw new BadRequestException('The report was already submitted and can no longer be replaced');
+    }
+    await this.prisma.testingRequest.update({
+      where: { id: requestId },
+      data: { reportFileKey: file.filename, reportFileName: file.originalname || 'report' },
+    });
+    return { message: 'File attached. Submit the report to finish.', fileName: file.originalname || 'report' };
+  }
+
+  async getReportFile(requestId: string, userId: string, role: string) {
+    const request = await this.prisma.testingRequest.findUnique({ where: { id: requestId } });
+    if (!request) throw new NotFoundException('Request not found');
+    const allowed = request.requesterId === userId || request.agencyId === userId || role === 'ADMIN' || role === 'MODERATOR';
+    // Same 404 as "no file", so request ids can't be probed.
+    if (!allowed || !request.reportFileKey) throw new NotFoundException('No report file found');
+    // A requester only sees the file once the agency has submitted the report.
+    if (request.requesterId === userId && request.status !== TestingStatus.COMPLETED) {
+      throw new NotFoundException('No report file found');
+    }
+    const url = await this.storage.getPresignedUrl(request.reportFileKey, 600);
+    return { url, fileName: request.reportFileName || 'report' };
   }
 
   async updateStatus(requestId: string, userId: string, status: TestingStatus) {
@@ -280,12 +339,25 @@ export class TestingService {
       );
     }
 
-    return this.prisma.testingRequest.update({ where: { id: requestId }, data: { status } });
+    const updated = await this.prisma.testingRequest.update({ where: { id: requestId }, data: { status } });
+    const other = party === 'agency' ? request.requesterId : request.agencyId;
+    if (other) {
+      await this.notifications.notify({
+        userId: other,
+        type: NotificationType.TESTING_UPDATE,
+        title: `Testing request ${status.toLowerCase().replace('_', ' ')}`,
+        body: `A testing request is now ${status.replace('_', ' ').toLowerCase()}.`,
+        data: { link: party === 'agency' ? '/buyer' : '/testing-portal', requestId },
+      });
+    }
+    return updated;
   }
 }
 
 // ─── TRANSPORT SERVICE ────────────────────────────────────────────────────────
 export class CreateTransportRequestDto {
+  // Optional: send the request straight to one provider for a quote.
+  @IsOptional() @IsString() providerId?: string;
   @IsString() pickupLocation: string;
   @IsString() pickupCity: string;
   @IsString() deliveryLocation: string;
@@ -298,10 +370,27 @@ export class CreateTransportRequestDto {
   @IsOptional() @IsString() notes?: string;
 }
 
+// "Book" now means: ask this provider to quote the request. The price is
+// set by the provider's quote and fixed when the requester accepts it — the
+// client can no longer dictate (or default to 0) the agreed price.
 export class BookTransportDto {
   @IsString() requestId: string;
   @IsString() providerId: string;
-  @IsNumber() @Min(0) agreedPrice: number;
+  @IsOptional() @IsNumber() @Min(0) agreedPrice?: number; // ignored; kept so older clients don't break
+}
+
+export class QuoteTransportDto {
+  @IsNumber() @IsPositive() price: number;
+  @IsOptional() @IsDateString() estimatedArrival?: string;
+  @IsOptional() @IsString() note?: string;
+}
+
+export class TrackingUpdateDto {
+  @IsOptional() @IsIn(['PICKED_UP', 'IN_TRANSIT', 'DELIVERED']) status?: 'PICKED_UP' | 'IN_TRANSIT' | 'DELIVERED';
+  @IsOptional() @IsString() currentLocation?: string;
+  @IsOptional() @IsDateString() estimatedArrival?: string;
+  @IsOptional() @IsString() driverName?: string;
+  @IsOptional() @IsString() driverPhone?: string;
 }
 
 export class TransportQueryDto {
@@ -337,22 +426,26 @@ export class UpdateProviderDto {
 
 @Injectable()
 export class TransportService {
-  constructor(private prisma: PrismaService) {}
+  constructor(private prisma: PrismaService, private notifications: NotificationsService) {}
 
   // Admin: delist a transport provider without touching the underlying account
-  async adminSetActive(providerId: string, isActive: boolean) {
+  async adminSetActive(providerId: string, isActive: boolean, actorId?: string) {
     const provider = await this.prisma.transportProfile.findUnique({ where: { id: providerId } });
     if (!provider) throw new NotFoundException('Transport provider not found');
-    return this.prisma.transportProfile.update({ where: { id: providerId }, data: { isActive } });
+    const res = await this.prisma.transportProfile.update({ where: { id: providerId }, data: { isActive } });
+    await recordAudit(this.prisma, actorId, isActive ? 'transport_relisted' : 'transport_delisted', 'transport', providerId);
+    return res;
   }
 
   // Admin: mark a transport provider as verified/unverified — see
   // TestingService.adminVerify above for the full reasoning. Round 2,
   // Milestone 6.
-  async adminVerify(providerId: string, verified: boolean) {
+  async adminVerify(providerId: string, verified: boolean, actorId?: string) {
     const provider = await this.prisma.transportProfile.findUnique({ where: { id: providerId } });
     if (!provider) throw new NotFoundException('Transport provider not found');
-    return this.prisma.transportProfile.update({ where: { id: providerId }, data: { isVerified: verified } });
+    const res = await this.prisma.transportProfile.update({ where: { id: providerId }, data: { isVerified: verified } });
+    await recordAudit(this.prisma, actorId, verified ? 'transport_verified' : 'transport_unverified', 'transport', providerId);
+    return res;
   }
 
   async adminFindAll() {
@@ -388,10 +481,28 @@ export class TransportService {
     return { data, meta: { total, page, limit, totalPages: Math.ceil(total / limit) } };
   }
 
+  private async assertProvider(providerUserId: string) {
+    const provider = await this.prisma.transportProfile.findUnique({ where: { userId: providerUserId } });
+    if (!provider || !provider.isActive) throw new NotFoundException('Transport provider not found');
+    return provider;
+  }
+
+  private async notifyProvider(request: { id: string; pickupCity: string; deliveryCity: string }, providerId: string) {
+    await this.notifications.notify({
+      userId: providerId,
+      type: NotificationType.TRANSPORT_UPDATE,
+      title: 'New transport request — quote needed',
+      body: `${request.pickupCity} → ${request.deliveryCity}. Open your portal to send a price.`,
+      data: { link: '/transport-portal', requestId: request.id },
+    });
+  }
+
   async createRequest(requesterId: string, dto: CreateTransportRequestDto) {
-    return this.prisma.transportRequest.create({
+    if (dto.providerId) await this.assertProvider(dto.providerId);
+    const created = await this.prisma.transportRequest.create({
       data: {
         requesterId,
+        providerId: dto.providerId,
         pickupLocation: dto.pickupLocation,
         pickupCity: dto.pickupCity,
         deliveryLocation: dto.deliveryLocation,
@@ -404,50 +515,178 @@ export class TransportService {
         notes: dto.notes,
       },
     });
+    if (dto.providerId) await this.notifyProvider(created, dto.providerId);
+    return created;
   }
 
+  // Sends (or re-sends) an existing request to a provider for a quote. No
+  // price is set here — see quote() / acceptQuote().
   async bookTransport(requesterId: string, dto: BookTransportDto) {
     const request = await this.prisma.transportRequest.findUnique({ where: { id: dto.requestId } });
     if (!request) throw new NotFoundException('Transport request not found');
     if (request.requesterId !== requesterId) throw new ForbiddenException('Not your request');
+    if (!['REQUESTED', 'QUOTED'].includes(request.status)) {
+      throw new BadRequestException(`This request is already ${request.status.toLowerCase().replace('_', ' ')}`);
+    }
+    await this.assertProvider(dto.providerId);
 
-    const provider = await this.prisma.transportProfile.findUnique({ where: { userId: dto.providerId } });
-    if (!provider) throw new NotFoundException('Transport provider not found');
-
-    return this.prisma.transportRequest.update({
+    const updated = await this.prisma.transportRequest.update({
       where: { id: dto.requestId },
-      data: {
-        providerId: dto.providerId,
-        agreedPrice: dto.agreedPrice,
-        status: 'BOOKED',
-      },
+      data: { providerId: dto.providerId, status: 'REQUESTED', quotedPrice: null, quoteNote: null, quotedAt: null, agreedPrice: null },
       include: {
         provider: { include: { user: { select: { profile: { select: { fullName: true } } } } } },
       },
     });
+    await this.notifyProvider(updated, dto.providerId);
+    return updated;
   }
 
-  async updateTracking(requestId: string, providerId: string, data: {
-    status?: string;
-    currentLocation?: string;
-    estimatedArrival?: Date;
-    driverName?: string;
-    driverPhone?: string;
-  }) {
+  // Provider answers a request with a price (and optional ETA / note).
+  async quote(requestId: string, providerId: string, dto: QuoteTransportDto) {
+    const request = await this.prisma.transportRequest.findUnique({ where: { id: requestId } });
+    if (!request) throw new NotFoundException('Request not found');
+    if (request.providerId !== providerId) throw new ForbiddenException('Not your request');
+    if (!['REQUESTED', 'QUOTED'].includes(request.status)) {
+      throw new BadRequestException(`A quote can't be sent while the request is ${request.status.toLowerCase().replace('_', ' ')}`);
+    }
+    const res = await this.prisma.transportRequest.updateMany({
+      where: { id: requestId, providerId, status: { in: ['REQUESTED', 'QUOTED'] as any } },
+      data: {
+        status: 'QUOTED' as any,
+        quotedPrice: dto.price,
+        quoteNote: dto.note?.trim() || null,
+        quotedAt: new Date(),
+        ...(dto.estimatedArrival && { estimatedArrival: new Date(dto.estimatedArrival) }),
+      },
+    });
+    if (res.count === 0) throw new BadRequestException('This request was just updated — refresh and try again');
+    await this.notifications.notify({
+      userId: request.requesterId,
+      type: NotificationType.TRANSPORT_UPDATE,
+      title: 'You received a transport quote',
+      body: `₨${Number(dto.price).toLocaleString()} for ${request.pickupCity} → ${request.deliveryCity}. Accept it to confirm the booking.`,
+      data: { link: '/buyer', requestId },
+    });
+    return this.prisma.transportRequest.findUnique({ where: { id: requestId } });
+  }
+
+  // Requester accepts the quote: the agreed price is the QUOTED price.
+  async acceptQuote(requestId: string, requesterId: string) {
+    const request = await this.prisma.transportRequest.findUnique({ where: { id: requestId } });
+    if (!request) throw new NotFoundException('Request not found');
+    if (request.requesterId !== requesterId) throw new ForbiddenException('Not your request');
+    if (request.status !== 'QUOTED' || request.quotedPrice == null || !request.providerId) {
+      throw new BadRequestException('There is no quote to accept on this request');
+    }
+    const res = await this.prisma.transportRequest.updateMany({
+      where: { id: requestId, status: 'QUOTED' as any, quotedPrice: request.quotedPrice },
+      data: { status: 'BOOKED' as any, agreedPrice: request.quotedPrice },
+    });
+    if (res.count === 0) throw new BadRequestException('The quote changed — review the new price and accept again');
+    await this.notifications.notify({
+      userId: request.providerId,
+      type: NotificationType.TRANSPORT_UPDATE,
+      title: 'Quote accepted — shipment booked',
+      body: `₨${Number(request.quotedPrice).toLocaleString()} for ${request.pickupCity} → ${request.deliveryCity}.`,
+      data: { link: '/transport-portal', requestId },
+    });
+    return this.prisma.transportRequest.findUnique({ where: { id: requestId } });
+  }
+
+  // Provider turns a request down; it returns to the requester unassigned
+  // so they can pick another provider.
+  async declineRequest(requestId: string, providerId: string, reason?: string) {
+    const request = await this.prisma.transportRequest.findUnique({ where: { id: requestId } });
+    if (!request) throw new NotFoundException('Request not found');
+    if (request.providerId !== providerId) throw new ForbiddenException('Not your request');
+    if (!['REQUESTED', 'QUOTED'].includes(request.status)) {
+      throw new BadRequestException('Only requests awaiting a quote or acceptance can be declined');
+    }
+    const why = (reason || '').trim();
+    if (why.length < 5) throw new BadRequestException('Give the requester a short reason (at least 5 characters)');
+    const res = await this.prisma.transportRequest.updateMany({
+      where: { id: requestId, providerId, status: { in: ['REQUESTED', 'QUOTED'] as any } },
+      data: { providerId: null, status: 'REQUESTED' as any, quotedPrice: null, quoteNote: null, quotedAt: null },
+    });
+    if (res.count === 0) throw new BadRequestException('This request was just updated — refresh and try again');
+    await this.notifications.notify({
+      userId: request.requesterId,
+      type: NotificationType.TRANSPORT_UPDATE,
+      title: 'A transporter declined your request',
+      body: `${request.pickupCity} → ${request.deliveryCity}: ${why}. You can send it to another provider.`,
+      data: { link: '/buyer', requestId },
+    });
+    return { message: 'Request declined' };
+  }
+
+  async cancelRequest(requestId: string, requesterId: string) {
+    const request = await this.prisma.transportRequest.findUnique({ where: { id: requestId } });
+    if (!request) throw new NotFoundException('Request not found');
+    if (request.requesterId !== requesterId) throw new ForbiddenException('Not your request');
+    if (!['REQUESTED', 'QUOTED', 'BOOKED'].includes(request.status)) {
+      throw new BadRequestException('This shipment has already been picked up and can no longer be cancelled');
+    }
+    const res = await this.prisma.transportRequest.updateMany({
+      where: { id: requestId, status: { in: ['REQUESTED', 'QUOTED', 'BOOKED'] as any } },
+      data: { status: 'CANCELLED' as any },
+    });
+    if (res.count === 0) throw new BadRequestException('This request was just updated — refresh and try again');
+    if (request.providerId) {
+      await this.notifications.notify({
+        userId: request.providerId,
+        type: NotificationType.TRANSPORT_UPDATE,
+        title: 'Transport request cancelled',
+        body: `${request.pickupCity} → ${request.deliveryCity} was cancelled by the requester.`,
+        data: { link: '/transport-portal', requestId },
+      });
+    }
+    return { message: 'Request cancelled' };
+  }
+
+  private static readonly TRACKING_NEXT: Record<string, string[]> = {
+    BOOKED: ['PICKED_UP'],
+    PICKED_UP: ['IN_TRANSIT', 'DELIVERED'],
+    IN_TRANSIT: ['DELIVERED'],
+  };
+
+  async updateTracking(requestId: string, providerId: string, data: TrackingUpdateDto) {
     const request = await this.prisma.transportRequest.findUnique({ where: { id: requestId } });
     if (!request) throw new NotFoundException('Request not found');
     if (request.providerId !== providerId) throw new ForbiddenException('Not your shipment');
+    // Tracking only makes sense for a confirmed, live shipment — never on
+    // a request that is still being quoted, or already delivered/cancelled.
+    if (!['BOOKED', 'PICKED_UP', 'IN_TRANSIT'].includes(request.status)) {
+      throw new BadRequestException(`Tracking can't be updated while the shipment is ${request.status.toLowerCase().replace('_', ' ')}`);
+    }
+    if (data.status && !TransportService.TRACKING_NEXT[request.status]?.includes(data.status)) {
+      throw new BadRequestException(`A shipment can't move from ${request.status} to ${data.status}`);
+    }
 
     const updateData: any = {};
     if (data.status) updateData.status = data.status;
     if (data.currentLocation) updateData.currentLocation = data.currentLocation;
-    if (data.estimatedArrival) updateData.estimatedArrival = data.estimatedArrival;
+    if (data.estimatedArrival) updateData.estimatedArrival = new Date(data.estimatedArrival);
     if (data.driverName) updateData.driverName = data.driverName;
     if (data.driverPhone) updateData.driverPhone = data.driverPhone;
     if (data.status === 'PICKED_UP') updateData.pickedUpAt = new Date();
     if (data.status === 'DELIVERED') updateData.deliveredAt = new Date();
 
-    return this.prisma.transportRequest.update({ where: { id: requestId }, data: updateData });
+    const res = await this.prisma.transportRequest.updateMany({
+      where: { id: requestId, status: request.status },
+      data: updateData,
+    });
+    if (res.count === 0) throw new BadRequestException('This shipment was just updated — refresh and try again');
+
+    if (data.status) {
+      await this.notifications.notify({
+        userId: request.requesterId,
+        type: NotificationType.TRANSPORT_UPDATE,
+        title: `Shipment ${data.status.toLowerCase().replace('_', ' ')}`,
+        body: `${request.pickupCity} → ${request.deliveryCity} is now ${data.status.toLowerCase().replace('_', ' ')}${data.currentLocation ? ` (${data.currentLocation})` : ''}.`,
+        data: { link: '/buyer', requestId },
+      });
+    }
+    return this.prisma.transportRequest.findUnique({ where: { id: requestId } });
   }
 
   // ─── OPERATOR SELF-SERVICE ──────────────────────────────────────────────
@@ -501,12 +740,14 @@ export class TransportService {
     });
   }
 
+  // Public (no login) — the driver's phone number is deliberately NOT
+  // returned here; anyone holding a shipment id could otherwise read it.
   async track(requestId: string) {
     const request = await this.prisma.transportRequest.findUnique({
       where: { id: requestId },
       select: {
         id: true, status: true, currentLocation: true, estimatedArrival: true,
-        driverName: true, driverPhone: true, pickupCity: true, deliveryCity: true,
+        driverName: true, pickupCity: true, deliveryCity: true,
         pickedUpAt: true, deliveredAt: true, trackingUrl: true,
       },
     });

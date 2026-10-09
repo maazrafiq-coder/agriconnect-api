@@ -5,6 +5,11 @@ import * as bcrypt from 'bcrypt';
 const prisma = new PrismaClient();
 
 async function main() {
+  // The seed creates demo accounts with a publicly documented password
+  // (Admin@123). Never let it run against a production database by accident.
+  if (process.env.NODE_ENV === 'production' && process.env.ALLOW_SEED_IN_PROD !== 'yes-i-understand') {
+    throw new Error('Refusing to seed: NODE_ENV=production. The seed creates demo users with known passwords.');
+  }
   console.log('🌱 Seeding AgriConnect database...');
 
   // ─── CATEGORIES ───────────────────────────────────────────────────────────
@@ -26,6 +31,16 @@ async function main() {
     { name: 'Livestock Feed', slug: 'livestock-feed',  icon: '🐄', sortOrder: 11 },
     { name: 'Other',          slug: 'other',           icon: '📦', sortOrder: 12 },
   ];
+
+  // Dev-only reference prices (PKR/ton) so receipts can be valued locally.
+  // In production an admin sets these in Settings → Fee & Commodity Prices.
+  for (const [label, pricePerTon] of [['Rice', 152000], ['Wheat', 110000], ['Maize', 95000]] as const) {
+    await prisma.commodityPrice.upsert({
+      where: { commodity: label.toLowerCase() },
+      update: {},
+      create: { commodity: label.toLowerCase(), label, pricePerTon },
+    });
+  }
 
   for (const cat of initialCategories) {
     await prisma.category.upsert({

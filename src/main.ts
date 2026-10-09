@@ -75,10 +75,34 @@ async function bootstrap() {
     .addTag('transport', 'Transport providers and bookings')
     .build();
 
-  const document = SwaggerModule.createDocument(app, config);
-  SwaggerModule.setup('docs', app, document, {
-    swaggerOptions: { persistAuthorization: true },
-  });
+  // Swagger exposes the full API surface. Open by default outside
+  // production; in production it is OFF unless ENABLE_SWAGGER=true, and
+  // even then it requires HTTP basic auth (SWAGGER_USER / SWAGGER_PASSWORD).
+  const isProd = process.env.NODE_ENV === 'production';
+  const swaggerEnabled = !isProd || process.env.ENABLE_SWAGGER === 'true';
+  if (swaggerEnabled) {
+    if (isProd) {
+      const user = process.env.SWAGGER_USER;
+      const pass = process.env.SWAGGER_PASSWORD;
+      if (!user || !pass) {
+        throw new Error('ENABLE_SWAGGER=true in production requires SWAGGER_USER and SWAGGER_PASSWORD');
+      }
+      const expected = 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64');
+      app.use(['/docs', '/docs-json'], (req: any, res: any, next: any) => {
+        if (req.headers.authorization === expected) return next();
+        res.setHeader('WWW-Authenticate', 'Basic realm="AgriConnect API docs"');
+        res.status(401).send('Authentication required');
+      });
+    }
+    const document = SwaggerModule.createDocument(app, config);
+    SwaggerModule.setup('docs', app, document, {
+      swaggerOptions: { persistAuthorization: true },
+    });
+  }
+
+  if (isProd && process.env.OTP_DEV_MODE === 'true') {
+    console.warn('⚠️  OTP_DEV_MODE is ON in production (ALLOW_INSECURE_DEV_OTP) — code 000000 is accepted for EVERY account. Do not leave this on for real users.');
+  }
 
   // ─── START ────────────────────────────────────────────────────────────────
   const port = process.env.PORT || 3000;
@@ -89,7 +113,7 @@ async function bootstrap() {
   console.log('─────────────────────────────────────────');
   console.log(`🚀  Server:  http://localhost:${port}`);
   console.log(`📋  API:     http://localhost:${port}/${apiPrefix}`);
-  console.log(`📖  Docs:    http://localhost:${port}/docs`);
+  if (swaggerEnabled) console.log(`📖  Docs:    http://localhost:${port}/docs`);
   console.log(`🌱  Env:     ${process.env.NODE_ENV || 'development'}`);
   console.log('─────────────────────────────────────────');
 }

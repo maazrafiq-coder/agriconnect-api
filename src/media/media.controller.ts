@@ -5,6 +5,7 @@ import {
 import { FilesInterceptor } from '@nestjs/platform-express';
 import { MediaService } from './media.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { RequireApproved } from '../common/guards/approved-user.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 
 @Controller('media')
@@ -22,7 +23,7 @@ export class MediaController {
   // Round 2, Milestone 4: storage engine now configured at module level
   // (see media.module.ts) — see auth.module.ts for full reasoning.
   @Post(':entityType/:entityId')
-  @UseGuards(JwtAuthGuard)
+  @RequireApproved()
   @UseInterceptors(FilesInterceptor('files', 10))
   upload(
     @Param('entityType') entityType: string,
@@ -36,14 +37,14 @@ export class MediaController {
 
   // PATCH /media/:id/set-primary — set as the display picture
   @Patch(':id/set-primary')
-  @UseGuards(JwtAuthGuard)
+  @RequireApproved()
   setPrimary(@Param('id') id: string, @CurrentUser('id') userId: string) {
     return this.mediaService.setPrimary(id, userId);
   }
 
   // DELETE /media/:id
   @Delete(':id')
-  @UseGuards(JwtAuthGuard)
+  @RequireApproved()
   remove(@Param('id') id: string, @CurrentUser('id') userId: string) {
     return this.mediaService.remove(id, userId);
   }

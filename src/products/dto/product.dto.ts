@@ -91,6 +91,8 @@ export class CreateProductDto {
 }
 
 export class UpdateProductDto {
+  // Category and unit are deliberately NOT editable: offers and orders on
+  // the listing were priced against them.
   @IsOptional() @IsString()
   name?: string;
 
@@ -103,8 +105,28 @@ export class UpdateProductDto {
   @IsOptional() @IsNumber() @Min(0)
   askingPrice?: number;
 
+  @IsOptional() @IsNumber() @Min(0)
+  minOrderQty?: number;
+
+  @IsOptional() @IsString()
+  locationCity?: string;
+
+  @IsOptional() @IsString()
+  locationProvince?: string;
+
+  @IsOptional() @IsDateString()
+  harvestDate?: string;
+
+  @IsOptional() @IsString()
+  packagingType?: string;
+
   @IsOptional() @IsString()
   deliveryTerms?: string;
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => RiceDetailDto)
+  riceDetails?: RiceDetailDto;
 }
 
 export class ProductQueryDto {

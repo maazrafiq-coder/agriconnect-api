@@ -163,7 +163,7 @@ prisma/
 
 | Role | Phone | Password |
 |------|-------|----------|
-| Admin | 0300-0000000 | Admin@123 |
+| Admin | 0300-0000000 | Admin@123 (**local/dev only** — the seed refuses to run when `NODE_ENV=production`; if a seeded admin ever reached a real database, change its password immediately) |
 | Seller/Trader | 0300-1111111 | Seller@123 |
 | Buyer/Exporter | 0300-2222222 | Buyer@123 |
 | Warehouse Op. | 0300-3333333 | Warehouse@123 |
@@ -219,16 +219,28 @@ railway variables set JWT_SECRET="..."
 ```
 
 ### Docker
-```dockerfile
-FROM node:20-alpine
-WORKDIR /app
-COPY package*.json ./
-RUN npm ci --only=production
-COPY . .
-RUN npx prisma generate
-RUN npm run build
-EXPOSE 3000
-CMD ["node", "dist/main"]
+A multi-stage `Dockerfile` is included (build → slim runtime, non-root, `tini`).
+
+```bash
+docker build -t agriconnect-api .
+docker compose up --build          # API + Postgres for local use (uses .env)
+```
+On start the entrypoint runs `prisma migrate deploy` when `prisma/migrations/` has migrations, otherwise `prisma db push` (the old behaviour). Set `SKIP_DB_SETUP=true` to skip both.
+
+### Moving from `db push` to migrations (one-time)
+```bash
+# DATABASE_URL = your existing database (back it up first)
+npm run db:baseline     # writes prisma/migrations/0_init and marks it applied
+git add prisma/migrations
+```
+After that: `npx prisma migrate dev --name <change>` locally, `npm run db:deploy` in production.
+
+### Tests
+```bash
+npm test                                   # unit tests (no database needed)
+docker compose -f docker-compose.test.yml up -d
+export TEST_DATABASE_URL=postgresql://test:test@localhost:5433/agri_test
+npm run test:integration:setup && npm run test:integration   # real-Postgres tests
 ```
 
 ---

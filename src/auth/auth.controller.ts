@@ -69,6 +69,13 @@ export class AuthController {
     return this.authService.register(dto);
   }
 
+  @Post('resend-otp')
+  @HttpCode(HttpStatus.OK)
+  @Throttle({ default: { limit: 5, ttl: 60000 } })
+  resendOtp(@Body('identifier') identifier: string) {
+    return this.authService.resendRegistrationOtp(String(identifier ?? ''));
+  }
+
   @Post('verify-otp')
   @HttpCode(HttpStatus.OK)
   @UseGuards(OtpThrottleGuard)

@@ -16,11 +16,32 @@ export const envValidationSchema = Joi.object({
   JWT_SECRET: Joi.string().min(32).required()
     .messages({ 'string.min': 'JWT_SECRET must be at least 32 characters — generate one with `openssl rand -hex 32`' }),
   JWT_EXPIRES_IN: Joi.string().default('15m'),
-  JWT_REFRESH_SECRET: Joi.string().min(32).required(),
+  // Refresh tokens are opaque random values stored hashed in the database;
+  // no signing secret is used, so this is optional (kept for compatibility).
+  JWT_REFRESH_SECRET: Joi.string().min(32).optional(),
   JWT_REFRESH_EXPIRES_IN: Joi.string().default('7d'),
 
   OTP_EXPIRY_MINUTES: Joi.number().default(10),
-  OTP_DEV_MODE: Joi.boolean().default(false),
+  // OTP_DEV_MODE makes '000000' verify for EVERY account. In production the
+  // app refuses to boot with it on, unless ALLOW_INSECURE_DEV_OTP=true is
+  // also set (an explicit, noisy opt-in for UAT while no SMS provider exists).
+  ALLOW_INSECURE_DEV_OTP: Joi.boolean().default(false),
+  OTP_DEV_MODE: Joi.boolean().default(false).when('NODE_ENV', {
+    is: 'production',
+    then: Joi.when('ALLOW_INSECURE_DEV_OTP', {
+      is: true,
+      then: Joi.boolean(),
+      otherwise: Joi.boolean().valid(false).messages({
+        'any.only': 'OTP_DEV_MODE must be false in production (000000 would log in as anyone). Configure real OTP delivery, or set ALLOW_INSECURE_DEV_OTP=true to knowingly override for UAT.',
+      }),
+    }),
+  }),
+
+  // Swagger docs in production: off unless ENABLE_SWAGGER=true, which then
+  // also requires SWAGGER_USER and SWAGGER_PASSWORD (basic auth).
+  ENABLE_SWAGGER: Joi.boolean().default(false),
+  SWAGGER_USER: Joi.string().allow('').optional(),
+  SWAGGER_PASSWORD: Joi.string().allow('').optional(),
 
   TWILIO_ACCOUNT_SID: Joi.string().allow('').optional(),
   TWILIO_AUTH_TOKEN: Joi.string().allow('').optional(),

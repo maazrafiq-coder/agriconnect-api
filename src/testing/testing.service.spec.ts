@@ -1,3 +1,5 @@
+import { StorageService } from '../common/storage/storage.service';
+import { NotificationsService } from '../notifications/notifications.service';
 import { Test } from '@nestjs/testing';
 import { NotFoundException } from '@nestjs/common';
 import { TestingService, TransportService } from './testing.service';
@@ -25,7 +27,7 @@ describe('TestingService.adminVerify', () => {
       },
     };
     const moduleRef = await Test.createTestingModule({
-      providers: [TestingService, { provide: PrismaService, useValue: prisma }],
+      providers: [TestingService, { provide: PrismaService, useValue: prisma }, { provide: StorageService, useValue: { getPresignedUrl: jest.fn().mockResolvedValue('https://signed.example/r.pdf'), putObject: jest.fn(), deleteObject: jest.fn() } }, { provide: NotificationsService, useValue: { notify: jest.fn().mockResolvedValue(undefined), notifyMany: jest.fn().mockResolvedValue(undefined) } }],
     }).compile();
     service = moduleRef.get(TestingService);
   });
@@ -66,7 +68,7 @@ describe('TransportService.adminVerify', () => {
       },
     };
     const moduleRef = await Test.createTestingModule({
-      providers: [TransportService, { provide: PrismaService, useValue: prisma }],
+      providers: [TransportService, { provide: PrismaService, useValue: prisma }, { provide: StorageService, useValue: { getPresignedUrl: jest.fn().mockResolvedValue('https://signed.example/r.pdf'), putObject: jest.fn(), deleteObject: jest.fn() } }, { provide: NotificationsService, useValue: { notify: jest.fn().mockResolvedValue(undefined), notifyMany: jest.fn().mockResolvedValue(undefined) } }],
     }).compile();
     service = moduleRef.get(TransportService);
   });

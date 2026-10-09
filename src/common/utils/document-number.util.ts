@@ -7,7 +7,7 @@
 // own native Postgres autoincrement `*Seq` column, so uniqueness is
 // atomic and race-safe under concurrent requests with no extra locking.
 export function formatDocumentNumber(
-  prefix: 'INV' | 'GRN' | 'GOP',
+  prefix: 'INV' | 'GRN' | 'GOP' | 'WR',
   seq: number,
   createdAt: Date | string,
 ): string {

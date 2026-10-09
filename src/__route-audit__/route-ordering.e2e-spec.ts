@@ -246,6 +246,29 @@ describe('Round 2 / Milestone 1 — live route-ordering audit', () => {
     expect(touchedUserUpdate).toBe(true);
   });
 
+  test('Notifications: GET /unread-count and PATCH /read-all dispatch to their handlers, not :id/read', async () => {
+    const a = await hit('GET', '/notifications/unread-count');
+    expect(a.log.some((c) => c.model === 'notification' && c.method === 'count' && c.args?.where?.userId === 'test-admin-id')).toBe(true);
+    log.length = 0;
+    const b = await hit('PATCH', '/notifications/read-all');
+    expect(b.log.some((c) => c.model === 'notification' && c.method === 'updateMany')).toBe(true);
+    expect(b.log.some((c) => c.model === 'notification' && c.method === 'findUnique')).toBe(false);
+  });
+
+  test('GET /admin-review/:type/:id reaches the admin-review lookup for the right listing', async () => {
+    const { log: calls } = await hit('GET', '/admin-review/warehouse/fake-wh-id');
+    expect(calls.some((c) => c.model === 'warehouseProfile' && c.method === 'findUnique' && c.args?.where?.id === 'fake-wh-id')).toBe(true);
+  });
+
+  test('GET /warehouse/bookings/:id/messages is its own route, not bookings/:id', async () => {
+    const { log: calls } = await hit('GET', '/warehouse/bookings/fake-b1/messages');
+    // assertBookingParticipant looks the booking up first; getBooking would
+    // include `receipt` in its query instead of the participant `select`.
+    const lookup = calls.find((c) => c.model === 'storageBooking' && c.method === 'findUnique');
+    expect(lookup?.args?.where?.id).toBe('fake-b1');
+    expect(lookup?.args?.select).toBeDefined();
+  });
+
   test('PATCH /warehouse/admin/:id/verify dispatches to the admin-verify handler', async () => {
     const { status, log: calls } = await hit('PATCH', '/warehouse/admin/fake-wh-id/verify');
     console.log('PATCH warehouse/admin/:id/verify ->', status, JSON.stringify(calls));

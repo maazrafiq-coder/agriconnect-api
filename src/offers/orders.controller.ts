@@ -21,6 +21,14 @@ export class OrdersController {
     return this.ordersService.findAll(userId, role, status);
   }
 
+  // GET /orders/admin/summary — server-side revenue / status totals
+  @Get('admin/summary')
+  @UseGuards(RolesGuard)
+  @Roles('ADMIN')
+  adminSummary() {
+    return this.ordersService.getAdminSummary();
+  }
+
   // GET /orders/admin — admin view all orders
   @Get('admin')
   @UseGuards(RolesGuard)
@@ -30,7 +38,7 @@ export class OrdersController {
     @Query('page') page = 1,
     @Query('limit') limit = 20,
   ) {
-    return this.ordersService.getAdminOrders(status, +page, +limit);
+    return this.ordersService.getAdminOrders(status, +page, Math.min(Math.max(+limit || 20, 1), 200));
   }
 
   // GET /orders/:id

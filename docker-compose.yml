@@ -1,0 +1,36 @@
+# Local development stack: Postgres + the API image.
+#   docker compose up --build
+# Works with no .env file (safe local defaults below); put overrides in .env
+# (copy .env.example) — values in `environment:` win over .env, so only the
+# DATABASE_URL / NODE_ENV below are forced.
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: agri
+      POSTGRES_PASSWORD: agri
+      POSTGRES_DB: agriconnect
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agri -d agriconnect"]
+      interval: 5s
+      retries: 10
+  api:
+    build: .
+    depends_on:
+      db: { condition: service_healthy }
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # The image defaults to NODE_ENV=production, which (by design) refuses to boot
+      # without S3 credentials and with the dev OTP. Locally we run as development.
+      NODE_ENV: development
+      DATABASE_URL: postgresql://agri:agri@db:5432/agriconnect
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:5173}
+      JWT_SECRET: ${JWT_SECRET:-local-dev-only-secret-change-me-0123456789abcdef}
+      OTP_DEV_MODE: ${OTP_DEV_MODE:-true}
+    ports: ["3000:3000"]
+volumes:
+  pgdata:

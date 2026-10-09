@@ -1,11 +1,14 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { withAgriConnectId } from '../common/utils/agri-connect-id.util';
+import { NotificationType } from '@prisma/client';
+import { recordAudit } from '../common/utils/audit.util';
+import { NotificationsService } from '../notifications/notifications.service';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 
 @Injectable()
 export class UsersService {
-  constructor(private prisma: PrismaService) {}
+  constructor(private prisma: PrismaService, private notifications: NotificationsService) {}
 
   async getProfile(userId: string) {
     const user = await this.prisma.user.findUnique({
@@ -191,7 +194,7 @@ export class UsersService {
   // "Pending Review" on every document even long after the account (and
   // implicitly its documents) had been approved. Sync them here so the
   // per-document status reflects the outcome the admin actually decided.
-  async adminUpdateKyc(userId: string, status: 'APPROVED' | 'REJECTED', note?: string) {
+  async adminUpdateKyc(userId: string, status: 'APPROVED' | 'REJECTED', note?: string, actorId?: string) {
     const documentStatus = status === 'APPROVED' ? 'approved' : 'rejected';
     const now = new Date();
 
@@ -215,11 +218,28 @@ export class UsersService {
       }),
     ]);
 
+    await recordAudit(this.prisma, actorId, status === 'APPROVED' ? 'kyc_approved' : 'kyc_rejected', 'user', userId, { note });
+    await this.notifications.notify({
+      userId,
+      type: NotificationType.KYC_UPDATE,
+      title: status === 'APPROVED' ? 'Your account was approved' : 'Your registration was not approved',
+      body: status === 'APPROVED'
+        ? 'You can now list, make offers and use every service on AgriConnect.'
+        : `Reason: ${note || 'not provided'}. Contact support if you think this is a mistake.`,
+      data: { link: '/account' },
+    });
     return user;
   }
 
   // Admin: suspend / activate user
-  async adminSetActive(userId: string, isActive: boolean) {
-    return this.prisma.user.update({ where: { id: userId }, data: { isActive } });
+  async adminSetActive(userId: string, isActive: boolean, actorId?: string) {
+    const user = await this.prisma.user.update({ where: { id: userId }, data: { isActive } });
+    // Suspension must end existing sessions immediately. (Access tokens are
+    // also rejected live by JwtStrategy; this stops refresh as well.)
+    if (!isActive) {
+      await this.prisma.refreshToken.updateMany({ where: { userId }, data: { isRevoked: true } });
+    }
+    await recordAudit(this.prisma, actorId, isActive ? 'user_reactivated' : 'user_suspended', 'user', userId);
+    return user;
   }
 }

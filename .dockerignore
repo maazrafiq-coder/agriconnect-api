@@ -1,0 +1,10 @@
+node_modules
+dist
+coverage
+.env
+.env.*
+!.env.example
+*.zip
+MIGRATION_NOTES_*.md
+ROUND2_FINAL_REPORT.md
+.git

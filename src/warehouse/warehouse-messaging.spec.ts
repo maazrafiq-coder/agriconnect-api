@@ -3,7 +3,13 @@ import { BadRequestException, ForbiddenException } from '@nestjs/common';
 import { WarehouseService } from './warehouse.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../common/storage/storage.service';
+import { NotificationsService } from '../notifications/notifications.service';
+import { SettingsService } from '../settings/settings.service';
 import { BookingStatus } from '@prisma/client';
+
+// Notifications are best-effort side effects; most tests only care that they
+// don't break the action. Specific tests assert on `notificationsStub.notify*`.
+const notificationsStub = { notify: jest.fn().mockResolvedValue(undefined), notifyMany: jest.fn().mockResolvedValue(undefined) };
 
 /** Booking conversation thread + insurance-rate validation (Oct 2026 issue list). */
 describe('WarehouseService — booking messages & insurance validation', () => {
@@ -31,7 +37,7 @@ describe('WarehouseService — booking messages & insurance validation', () => {
       },
     };
     const moduleRef = await Test.createTestingModule({
-      providers: [WarehouseService, { provide: PrismaService, useValue: prisma }, { provide: StorageService, useValue: {} }],
+      providers: [WarehouseService, { provide: PrismaService, useValue: prisma }, { provide: StorageService, useValue: {} }, { provide: NotificationsService, useValue: notificationsStub }, { provide: SettingsService, useValue: { getCommodityPricePerTon: jest.fn().mockResolvedValue(38000), getPlatformFeePct: jest.fn().mockResolvedValue(1.5) } }],
     }).compile();
     service = moduleRef.get(WarehouseService);
   });
@@ -41,6 +47,15 @@ describe('WarehouseService — booking messages & insurance validation', () => {
     expect(prisma.bookingMessage.create).toHaveBeenCalledWith({
       data: { bookingId: 'b1', senderId: 'op-1', kind: 'INFO_REQUEST', body: 'Which variety?' },
     });
+  });
+
+  it('notifies the depositor of an info request, and the operator of a depositor reply', async () => {
+    notificationsStub.notify.mockClear();
+    prisma.storageBooking.findUnique.mockResolvedValue({ ...booking(), bookingSeq: 5, createdAt: new Date('2026-03-01'), warehouse: { userId: 'op-1', name: 'WH' } });
+    await service.postBookingMessage('b1', 'op-1', 'WAREHOUSE', { body: 'Which variety?', kind: 'INFO_REQUEST' });
+    expect(notificationsStub.notify).toHaveBeenLastCalledWith(expect.objectContaining({ userId: 'buyer-1', title: 'Warehouse needs more information' }));
+    await service.postBookingMessage('b1', 'buyer-1', 'BUYER', { body: '1121 Basmati' });
+    expect(notificationsStub.notify).toHaveBeenLastCalledWith(expect.objectContaining({ userId: 'op-1' }));
   });
 
   it('downgrades a depositor-sent INFO_REQUEST to a normal message', async () => {

@@ -3,6 +3,12 @@ import { BadRequestException, ForbiddenException, NotFoundException } from '@nes
 import { WarehouseService } from './warehouse.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../common/storage/storage.service';
+import { NotificationsService } from '../notifications/notifications.service';
+import { SettingsService } from '../settings/settings.service';
+
+// Notifications are best-effort side effects; most tests only care that they
+// don't break the action. Specific tests assert on `notificationsStub.notify*`.
+const notificationsStub = { notify: jest.fn().mockResolvedValue(undefined), notifyMany: jest.fn().mockResolvedValue(undefined) };
 
 /**
  * Covers the invoice / Goods Receipt Note / Gate Out Pass workflow added
@@ -47,7 +53,10 @@ describe('WarehouseService — documents (invoice / GRN / gate-out pass)', () =>
         }),
         update: jest.fn().mockImplementation(({ data }) => Promise.resolve({ ...prisma.warehouseInvoice.__record, ...data })),
         findMany: jest.fn(),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
       },
+      transaction: { createMany: jest.fn().mockResolvedValue({ count: 1 }), create: jest.fn() },
+      $transaction: jest.fn().mockImplementation((arg: any) => (typeof arg === 'function' ? arg(prisma) : Promise.all(arg))),
       gateOutPass: {
         findFirst: jest.fn().mockResolvedValue(null),
         findUnique: jest.fn(),
@@ -55,6 +64,8 @@ describe('WarehouseService — documents (invoice / GRN / gate-out pass)', () =>
         update: jest.fn().mockImplementation(({ data }) => Promise.resolve({ id: 'pass-1', ...data })),
         findMany: jest.fn(),
       },
+      // No receipt/lien by default → gate-out isn't blocked. Lien tests override.
+      warehouseReceipt: { findUnique: jest.fn().mockResolvedValue(null) },
       goodsReceiptNote: {
         create: jest.fn().mockImplementation(({ data }) => Promise.resolve({ id: 'grn-1', grnSeq: 2, receivedAt: new Date('2026-02-01'), ...data })),
         update: jest.fn().mockImplementation(({ data }) => Promise.resolve({ id: 'grn-1', ...data })),
@@ -66,7 +77,7 @@ describe('WarehouseService — documents (invoice / GRN / gate-out pass)', () =>
       deleteObject: jest.fn(),
     };
     const moduleRef = await Test.createTestingModule({
-      providers: [WarehouseService, { provide: PrismaService, useValue: prisma }, { provide: StorageService, useValue: storage }],
+      providers: [WarehouseService, { provide: PrismaService, useValue: prisma }, { provide: StorageService, useValue: storage }, { provide: NotificationsService, useValue: notificationsStub }, { provide: SettingsService, useValue: { getCommodityPricePerTon: jest.fn().mockResolvedValue(38000), getPlatformFeePct: jest.fn().mockResolvedValue(1.5) } }],
     }).compile();
     service = moduleRef.get(WarehouseService);
   });
@@ -95,29 +106,61 @@ describe('WarehouseService — documents (invoice / GRN / gate-out pass)', () =>
   });
 
   describe('confirmInvoicePayment', () => {
-    const invoice = { id: 'inv-1', status: 'UNPAID', warehouse: { userId: 'operator-1' } };
+    const invoice = {
+      id: 'inv-1', status: 'UNPAID', invoiceNumber: 'INV-2026-000007', bookingId: 'booking-1', depositorId: 'depositor-1',
+      storageCost: 120000, insuranceCost: 5000, warehouse: { userId: 'operator-1' }, booking: { status: 'ACCEPTED' },
+    };
+    const paidAfter = (extra: any = {}) => ({ ...invoice, status: 'PAID', ...extra });
 
-    it('lets the owning operator confirm payment', async () => {
-      prisma.warehouseInvoice.findUnique.mockResolvedValue(invoice);
-      const result = await service.confirmInvoicePayment('operator-1', 'WAREHOUSE', 'inv-1', 'TXN-123');
+    beforeEach(() => {
+      // 1st findUnique = pre-check (UNPAID), 2nd = re-read inside the transaction.
+      prisma.warehouseInvoice.findUnique.mockResolvedValueOnce(invoice);
+    });
+
+    it('lets the owning operator confirm payment and books the ledger rows', async () => {
+      prisma.warehouseInvoice.findUnique.mockResolvedValueOnce(paidAfter({ paymentReference: 'TXN-123' }));
+      const result: any = await service.confirmInvoicePayment('operator-1', 'WAREHOUSE', 'inv-1', 'TXN-123');
       expect(result.status).toBe('PAID');
       expect(result.paymentReference).toBe('TXN-123');
+      const rows = prisma.transaction.createMany.mock.calls[0][0].data;
+      expect(rows.map((r: any) => r.type)).toEqual(['STORAGE_FEE', 'INSURANCE_PREMIUM']);
+      expect(rows[0]).toMatchObject({ userId: 'depositor-1', amount: 120000, referenceId: 'booking-1' });
+    });
+
+    it('skips the insurance row when there is no premium', async () => {
+      prisma.warehouseInvoice.findUnique.mockReset();
+      prisma.warehouseInvoice.findUnique.mockResolvedValueOnce({ ...invoice, insuranceCost: 0 }).mockResolvedValueOnce(paidAfter());
+      await service.confirmInvoicePayment('operator-1', 'WAREHOUSE', 'inv-1');
+      expect(prisma.transaction.createMany.mock.calls[0][0].data).toHaveLength(1);
     });
 
     it('lets an admin confirm payment even if not the warehouse owner', async () => {
-      prisma.warehouseInvoice.findUnique.mockResolvedValue(invoice);
-      const result = await service.confirmInvoicePayment('admin-1', 'ADMIN', 'inv-1', undefined);
+      prisma.warehouseInvoice.findUnique.mockResolvedValueOnce(paidAfter());
+      const result: any = await service.confirmInvoicePayment('admin-1', 'ADMIN', 'inv-1', undefined);
       expect(result.status).toBe('PAID');
     });
 
     it('rejects an unrelated user', async () => {
-      prisma.warehouseInvoice.findUnique.mockResolvedValue(invoice);
       await expect(service.confirmInvoicePayment('random-user', 'BUYER', 'inv-1')).rejects.toThrow(ForbiddenException);
+      expect(prisma.transaction.createMany).not.toHaveBeenCalled();
     });
 
     it('refuses to re-confirm an already-paid invoice', async () => {
+      prisma.warehouseInvoice.findUnique.mockReset();
       prisma.warehouseInvoice.findUnique.mockResolvedValue({ ...invoice, status: 'PAID' });
       await expect(service.confirmInvoicePayment('operator-1', 'WAREHOUSE', 'inv-1')).rejects.toThrow(BadRequestException);
+    });
+
+    it('refuses to book a double-click: guarded flip finds nothing to update', async () => {
+      prisma.warehouseInvoice.updateMany.mockResolvedValue({ count: 0 });
+      await expect(service.confirmInvoicePayment('operator-1', 'WAREHOUSE', 'inv-1')).rejects.toThrow(/already marked as paid/);
+      expect(prisma.transaction.createMany).not.toHaveBeenCalled();
+    });
+
+    it('refuses payment on a cancelled booking', async () => {
+      prisma.warehouseInvoice.findUnique.mockReset();
+      prisma.warehouseInvoice.findUnique.mockResolvedValue({ ...invoice, booking: { status: 'CANCELLED' } });
+      await expect(service.confirmInvoicePayment('operator-1', 'WAREHOUSE', 'inv-1')).rejects.toThrow(/cancelled/);
     });
   });
 
@@ -139,11 +182,42 @@ describe('WarehouseService — documents (invoice / GRN / gate-out pass)', () =>
     });
   });
 
+  describe('bank lien blocks gate-out until clearance is recorded', () => {
+    const lienReceipt = (status: string) => ({ id: 'r-1', lien: { id: 'lien-1', bankName: 'NBP', loanAmount: 4000000, status } });
+
+    it('refuses to request gate-out while an ACTIVE lien exists, naming the bank', async () => {
+      prisma.warehouseReceipt.findUnique.mockResolvedValue(lienReceipt('ACTIVE'));
+      await expect(service.requestGateOut('operator-1', 'booking-1')).rejects.toThrow(/NBP.*clearance/);
+      expect(prisma.gateOutPass.create).not.toHaveBeenCalled();
+    });
+
+    it('allows the request once the lien is RELEASED', async () => {
+      prisma.warehouseReceipt.findUnique.mockResolvedValue(lienReceipt('RELEASED'));
+      await expect(service.requestGateOut('operator-1', 'booking-1')).resolves.toBeDefined();
+    });
+
+    it('refuses to approve a pending pass if a lien was placed after the request', async () => {
+      prisma.gateOutPass.findUnique.mockResolvedValue({
+        id: 'pass-1', passSeq: 3, status: 'PENDING', depositorId: 'depositor-1', bookingId: 'booking-1',
+        quantityTons: 50, booking: { commodity: 'Rice' }, warehouse: { userId: 'operator-1', name: 'W' },
+      });
+      prisma.warehouseReceipt.findUnique.mockResolvedValue(lienReceipt('ACTIVE'));
+      await expect(service.approveGateOut('depositor-1', 'BUYER', 'pass-1')).rejects.toThrow(BadRequestException);
+      expect(storage.putObject).not.toHaveBeenCalled();
+    });
+
+    it('notifies the depositor when the warehouse requests release', async () => {
+      notificationsStub.notify.mockClear();
+      await service.requestGateOut('operator-1', 'booking-1');
+      expect(notificationsStub.notify).toHaveBeenCalledWith(expect.objectContaining({ userId: 'depositor-1', title: 'Release of your goods requested' }));
+    });
+  });
+
   describe('approveGateOut / rejectGateOut', () => {
     const pendingPass = {
-      id: 'pass-1', passSeq: 3, status: 'PENDING', depositorId: 'depositor-1',
+      id: 'pass-1', passSeq: 3, status: 'PENDING', depositorId: 'depositor-1', bookingId: 'booking-1',
       quantityTons: 50, booking: { commodity: 'Rice', variety: 'Basmati' },
-      warehouse: { name: 'Test Warehouse', address: '123 Main St', city: 'Lahore', province: 'Punjab' },
+      warehouse: { userId: 'operator-1', name: 'Test Warehouse', address: '123 Main St', city: 'Lahore', province: 'Punjab' },
     };
 
     it('lets the depositor approve their own gate-out request', async () => {

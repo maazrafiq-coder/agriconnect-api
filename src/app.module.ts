@@ -11,6 +11,7 @@ import { AuthModule } from './auth/auth.module';
 import { UsersModule } from './users/users.module';
 import { ProductsModule } from './products/products.module';
 import { OffersModule } from './offers/offers.module';
+import { SettingsModule } from './settings/settings.module';
 import { WarehouseModule } from './warehouse/warehouse.module';
 import { TestingModule } from './testing/testing.module';
 import { HealthModule } from './health/health.module';
@@ -18,6 +19,10 @@ import { CategoriesModule } from './categories/categories.module';
 import { CatalogModule } from './catalog/catalog.module';
 import { MediaModule } from './media/media.module';
 import { ReviewModule } from './review/review.module';
+import { NotificationsModule } from './notifications/notifications.module';
+import { StatsModule } from './stats/stats.module';
+import { AuditModule } from './audit/audit.module';
+import { AdminReviewModule } from './admin-review/admin-review.module';
 import { AllExceptionsFilter } from './common/filters/http-exception.filter';
 import { envValidationSchema } from './config/env.validation';
 
@@ -49,6 +54,7 @@ import { envValidationSchema } from './config/env.validation';
     UsersModule,
     ProductsModule,
     OffersModule,
+    SettingsModule,
     WarehouseModule,
     TestingModule,
     HealthModule,
@@ -56,6 +62,10 @@ import { envValidationSchema } from './config/env.validation';
     CatalogModule,
     MediaModule,
     ReviewModule,
+    NotificationsModule,
+    AdminReviewModule,
+    AuditModule,
+    StatsModule,
   ],
   providers: [
     // Global exception filter

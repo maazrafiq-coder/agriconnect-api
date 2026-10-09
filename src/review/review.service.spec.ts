@@ -194,7 +194,7 @@ describe('ReviewService — clarification workflow', () => {
 
     it('resolves a valid token back to the bucket key', async () => {
       const { url } = await service.getAttachmentSignedUrl('att-1', 'user-1', 'BUYER');
-      const token = url.split('/').pop();
+      const token = url.split('/').pop() as string;
       const resolved = await service.resolveFileToken(token);
       expect(resolved.fileName).toBe('cnic-front.jpg');
       expect(resolved.s3Key).toBe('clarification-123.jpg');
@@ -211,7 +211,7 @@ describe('ReviewService — clarification workflow', () => {
 
     it('refuses a token pointing at a since-deleted attachment', async () => {
       const { url } = await service.getAttachmentSignedUrl('att-1', 'user-1', 'BUYER');
-      const token = url.split('/').pop();
+      const token = url.split('/').pop() as string;
       prisma.clarificationAttachment.findUnique.mockResolvedValue(null);
       await expect(service.resolveFileToken(token)).rejects.toThrow(NotFoundException);
     });

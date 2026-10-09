@@ -1,7 +1,9 @@
-import { Controller, Get, Post, Patch, Param, Body, Query, UseGuards } from '@nestjs/common';
+import { Controller, Get, Post, Patch, Param, Body, Query, UseGuards, UseInterceptors, UploadedFile } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
 import { TestingService, CreateTestingRequestDto, SubmitReportDto, AgencyQueryDto, RegisterAgencyDto, UpdateAgencyDto } from './testing.service';
-import { TransportService, CreateTransportRequestDto, BookTransportDto, TransportQueryDto, RegisterProviderDto, UpdateProviderDto } from './testing.service';
+import { TransportService, QuoteTransportDto, TrackingUpdateDto, CreateTransportRequestDto, BookTransportDto, TransportQueryDto, RegisterProviderDto, UpdateProviderDto } from './testing.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { RequireApproved } from '../common/guards/approved-user.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
@@ -20,7 +22,7 @@ export class TestingController {
   // ─── OPERATOR SELF-SERVICE ───────────────────────────────────────────────
   // POST /testing/register — testing agency operator registers their listing
   @Post('register')
-  @UseGuards(JwtAuthGuard)
+  @RequireApproved()
   register(@CurrentUser('id') userId: string, @Body() dto: RegisterAgencyDto) {
     return this.testingService.registerAgency(userId, dto);
   }
@@ -34,13 +36,13 @@ export class TestingController {
 
   // PATCH /testing/my-agency — edit own listing
   @Patch('my-agency')
-  @UseGuards(JwtAuthGuard)
+  @RequireApproved()
   updateMyAgency(@CurrentUser('id') userId: string, @Body() dto: UpdateAgencyDto) {
     return this.testingService.updateMyAgency(userId, dto);
   }
 
   @Post('requests')
-  @UseGuards(JwtAuthGuard)
+  @RequireApproved()
   createRequest(@CurrentUser('id') userId: string, @Body() dto: CreateTestingRequestDto) {
     return this.testingService.createRequest(userId, dto);
   }
@@ -55,7 +57,7 @@ export class TestingController {
   }
 
   @Patch('requests/:id/status')
-  @UseGuards(JwtAuthGuard)
+  @RequireApproved()
   updateStatus(
     @Param('id') id: string,
     @CurrentUser('id') userId: string,
@@ -65,13 +67,36 @@ export class TestingController {
   }
 
   @Post('requests/:id/report')
-  @UseGuards(JwtAuthGuard)
+  @RequireApproved()
   submitReport(
     @Param('id') id: string,
     @CurrentUser('id') userId: string,
     @Body() dto: SubmitReportDto,
   ) {
     return this.testingService.submitReport(id, userId, dto);
+  }
+
+  // POST /testing/requests/:id/report-file — multipart field "file" (PDF/JPG/PNG, ≤10MB)
+  @Post('requests/:id/report-file')
+  @RequireApproved()
+  @UseInterceptors(FileInterceptor('file'))
+  uploadReportFile(
+    @Param('id') id: string,
+    @CurrentUser('id') userId: string,
+    @UploadedFile() file: Express.Multer.File,
+  ) {
+    return this.testingService.uploadReportFile(id, userId, file);
+  }
+
+  // GET /testing/requests/:id/report-file — fresh signed link (requester, agency, staff)
+  @Get('requests/:id/report-file')
+  @UseGuards(JwtAuthGuard)
+  getReportFile(
+    @Param('id') id: string,
+    @CurrentUser('id') userId: string,
+    @CurrentUser('role') role: string,
+  ) {
+    return this.testingService.getReportFile(id, userId, role);
   }
 
   // GET /testing/admin/all — includes delisted agencies too
@@ -86,16 +111,16 @@ export class TestingController {
   @Patch('admin/:id/active')
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles('ADMIN')
-  adminSetActive(@Param('id') id: string, @Body('isActive') isActive: boolean) {
-    return this.testingService.adminSetActive(id, isActive);
+  adminSetActive(@Param('id') id: string, @Body('isActive') isActive: boolean, @CurrentUser('id') adminId: string) {
+    return this.testingService.adminSetActive(id, isActive, adminId);
   }
 
   // PATCH /testing/admin/:id/verify — Round 2, Milestone 6
   @Patch('admin/:id/verify')
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles('ADMIN')
-  adminVerify(@Param('id') id: string, @Body('verified') verified: boolean) {
-    return this.testingService.adminVerify(id, verified);
+  adminVerify(@Param('id') id: string, @Body('verified') verified: boolean, @CurrentUser('id') adminId: string) {
+    return this.testingService.adminVerify(id, verified, adminId);
   }
 }
 
@@ -112,7 +137,7 @@ export class TransportController {
   // ─── OPERATOR SELF-SERVICE ───────────────────────────────────────────────
   // POST /transport/register — transport provider operator registers their listing
   @Post('register')
-  @UseGuards(JwtAuthGuard)
+  @RequireApproved()
   register(@CurrentUser('id') userId: string, @Body() dto: RegisterProviderDto) {
     return this.transportService.registerProvider(userId, dto);
   }
@@ -126,19 +151,19 @@ export class TransportController {
 
   // PATCH /transport/my-provider — edit own listing
   @Patch('my-provider')
-  @UseGuards(JwtAuthGuard)
+  @RequireApproved()
   updateMyProvider(@CurrentUser('id') userId: string, @Body() dto: UpdateProviderDto) {
     return this.transportService.updateMyProvider(userId, dto);
   }
 
   @Post('requests')
-  @UseGuards(JwtAuthGuard)
+  @RequireApproved()
   createRequest(@CurrentUser('id') userId: string, @Body() dto: CreateTransportRequestDto) {
     return this.transportService.createRequest(userId, dto);
   }
 
   @Post('book')
-  @UseGuards(JwtAuthGuard)
+  @RequireApproved()
   book(@CurrentUser('id') userId: string, @Body() dto: BookTransportDto) {
     return this.transportService.bookTransport(userId, dto);
   }
@@ -152,12 +177,39 @@ export class TransportController {
     return this.transportService.getMyRequests(userId, role);
   }
 
+  // Provider sends a price for the request
+  @Patch('requests/:id/quote')
+  @RequireApproved()
+  quote(@Param('id') id: string, @CurrentUser('id') userId: string, @Body() dto: QuoteTransportDto) {
+    return this.transportService.quote(id, userId, dto);
+  }
+
+  // Requester accepts the quote -> BOOKED at the quoted price
+  @Patch('requests/:id/accept')
+  @RequireApproved()
+  acceptQuote(@Param('id') id: string, @CurrentUser('id') userId: string) {
+    return this.transportService.acceptQuote(id, userId);
+  }
+
+  // Provider declines (request returns to the requester unassigned)
+  @Patch('requests/:id/decline')
+  @RequireApproved()
+  decline(@Param('id') id: string, @CurrentUser('id') userId: string, @Body('reason') reason: string) {
+    return this.transportService.declineRequest(id, userId, reason);
+  }
+
+  @Patch('requests/:id/cancel')
+  @RequireApproved()
+  cancel(@Param('id') id: string, @CurrentUser('id') userId: string) {
+    return this.transportService.cancelRequest(id, userId);
+  }
+
   @Patch('requests/:id/tracking')
-  @UseGuards(JwtAuthGuard)
+  @RequireApproved()
   updateTracking(
     @Param('id') id: string,
     @CurrentUser('id') userId: string,
-    @Body() data: any,
+    @Body() data: TrackingUpdateDto,
   ) {
     return this.transportService.updateTracking(id, userId, data);
   }
@@ -179,15 +231,15 @@ export class TransportController {
   @Patch('admin/:id/active')
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles('ADMIN')
-  adminSetActive(@Param('id') id: string, @Body('isActive') isActive: boolean) {
-    return this.transportService.adminSetActive(id, isActive);
+  adminSetActive(@Param('id') id: string, @Body('isActive') isActive: boolean, @CurrentUser('id') adminId: string) {
+    return this.transportService.adminSetActive(id, isActive, adminId);
   }
 
   // PATCH /transport/admin/:id/verify — Round 2, Milestone 6
   @Patch('admin/:id/verify')
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles('ADMIN')
-  adminVerify(@Param('id') id: string, @Body('verified') verified: boolean) {
-    return this.transportService.adminVerify(id, verified);
+  adminVerify(@Param('id') id: string, @Body('verified') verified: boolean, @CurrentUser('id') adminId: string) {
+    return this.transportService.adminVerify(id, verified, adminId);
   }
 }
