@@ -6,6 +6,9 @@ import * as compression from 'compression';
 import * as cookieParser from 'cookie-parser';
 import { mkdirSync } from 'fs';
 import { AppModule } from './app.module';
+import { appLogger } from './common/logging/app-logger';
+import { requestIdMiddleware } from './common/logging/request-id.middleware';
+import { initSentry } from './common/observability/sentry';
 
 // Multer's diskStorage does NOT create missing destination directories —
 // it throws ENOENT on the first upload if they don't already exist. These
@@ -23,7 +26,17 @@ function ensureUploadDirsExist() {
 async function bootstrap() {
   ensureUploadDirsExist();
 
-  const app = await NestFactory.create(AppModule);
+  initSentry();
+  const app = await NestFactory.create(AppModule, { logger: appLogger });
+
+  // Behind Railway/nginx, req.ip is the proxy unless told how many hops to
+  // trust — which would make the rate limiter treat every user as one client.
+  if (process.env.TRUST_PROXY !== undefined && process.env.TRUST_PROXY !== '') {
+    (app as any).set('trust proxy', Number(process.env.TRUST_PROXY));
+  }
+  app.use(requestIdMiddleware);
+  // Finish in-flight requests and close the DB cleanly on SIGTERM (deploys).
+  app.enableShutdownHooks();
 
   // ─── SECURITY HEADERS ───────────────────────────────────────────────────────
   app.use(helmet());
@@ -35,6 +48,7 @@ async function bootstrap() {
     origin: process.env.FRONTEND_URL || 'http://localhost:5173',
     methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
+    exposedHeaders: ['X-Request-Id'],
     credentials: true, // required so the httpOnly refresh-token cookie is sent/received
   });
 
@@ -101,7 +115,7 @@ async function bootstrap() {
   }
 
   if (isProd && process.env.OTP_DEV_MODE === 'true') {
-    console.warn('⚠️  OTP_DEV_MODE is ON in production (ALLOW_INSECURE_DEV_OTP) — code 000000 is accepted for EVERY account. Do not leave this on for real users.');
+    appLogger.warn('⚠️  OTP_DEV_MODE is ON in production (ALLOW_INSECURE_DEV_OTP) — code 000000 is accepted for EVERY account. Do not leave this on for real users.');
   }
 
   // ─── START ────────────────────────────────────────────────────────────────

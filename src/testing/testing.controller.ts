@@ -1,3 +1,4 @@
+import { Throttle } from '@nestjs/throttler';
 import { Controller, Get, Post, Patch, Param, Body, Query, UseGuards, UseInterceptors, UploadedFile } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { TestingService, CreateTestingRequestDto, SubmitReportDto, AgencyQueryDto, RegisterAgencyDto, UpdateAgencyDto } from './testing.service';
@@ -214,7 +215,10 @@ export class TransportController {
     return this.transportService.updateTracking(id, userId, data);
   }
 
+  // Public by design (shared link). Tighter than the global limit so the id
+  // space can't be probed: 20 lookups/min/IP.
   @Get('track/:id')
+  @Throttle({ default: { limit: 20, ttl: 60000 } })
   track(@Param('id') id: string) {
     return this.transportService.track(id);
   }

@@ -47,6 +47,19 @@ export const envValidationSchema = Joi.object({
   TWILIO_AUTH_TOKEN: Joi.string().allow('').optional(),
   TWILIO_PHONE_NUMBER: Joi.string().allow('').optional(),
 
+  // ── Operations (Round 3 M9) ──
+  // Set when the app runs behind a reverse proxy (Railway, nginx): number of
+  // proxy hops to trust so req.ip is the real client, not the proxy. Without
+  // it every user shares one IP and the rate limiter throttles them together.
+  // Railway = 1. Leave unset for direct exposure.
+  TRUST_PROXY: Joi.number().integer().min(0).max(10).optional(),
+  LOG_LEVEL: Joi.string().valid('error', 'warn', 'log', 'debug', 'verbose').default('log'),
+  LOG_FORMAT: Joi.string().valid('json', 'pretty').optional(),
+  // Error reporting is OFF unless a DSN is set AND `@sentry/node` is installed.
+  SENTRY_DSN: Joi.string().uri().allow('').optional(),
+  SENTRY_ENVIRONMENT: Joi.string().allow('').optional(),
+  SENTRY_TRACES_SAMPLE_RATE: Joi.number().min(0).max(1).default(0),
+
   UPLOAD_DEST: Joi.string().default('./uploads'),
   MAX_FILE_SIZE_MB: Joi.number().default(10),
 

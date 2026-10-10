@@ -27,4 +27,7 @@ COPY scripts/docker-entrypoint.sh ./scripts/docker-entrypoint.sh
 RUN sed -i 's/\r$//' ./scripts/docker-entrypoint.sh && chmod +x ./scripts/docker-entrypoint.sh && chown -R node:node /app
 USER node
 EXPOSE 3000
+# Liveness only (no DB): a database outage must not make Docker kill the app.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+  CMD node -e "const p=process.env.PORT||3000,a=process.env.API_PREFIX||'api/v1';require('http').get('http://127.0.0.1:'+p+'/'+a+'/health/live',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
 ENTRYPOINT ["/usr/bin/tini", "--", "./scripts/docker-entrypoint.sh"]

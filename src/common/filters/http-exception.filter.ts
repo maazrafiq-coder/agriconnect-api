@@ -8,6 +8,7 @@ import {
 } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { Prisma } from '@prisma/client';
+import { captureException } from '../observability/sentry';
 
 @Catch()
 export class AllExceptionsFilter implements ExceptionFilter {
@@ -73,6 +74,7 @@ export class AllExceptionsFilter implements ExceptionFilter {
     const errorResponse = {
       statusCode: status,
       timestamp: new Date().toISOString(),
+      requestId: (request as any).id,
       path: request.url,
       method: request.method,
       error: typeof message === 'string' ? { message } : message,
@@ -80,9 +82,10 @@ export class AllExceptionsFilter implements ExceptionFilter {
 
     if (status >= 500) {
       this.logger.error(
-        `${request.method} ${request.url}`,
+        `${request.method} ${request.url.split('?')[0]}`,
         exception instanceof Error ? exception.stack : String(exception),
       );
+      captureException(exception, { requestId: (request as any).id, method: request.method, path: request.url.split('?')[0] });
     }
 
     response.status(status).json(errorResponse);

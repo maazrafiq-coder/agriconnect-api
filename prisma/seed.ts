@@ -118,6 +118,31 @@ async function main() {
     },
   });
 
+  // ─── DEMO MODERATOR ──────────────────────────────────────────────────────
+  // Moderators review KYC and recommend; only ADMIN gives final approval.
+  const modHash = await bcrypt.hash('Moderator@123', 10);
+  await prisma.user.upsert({
+    where: { phoneNumber: '0300-6666666' },
+    update: {},
+    create: {
+      phoneNumber: '0300-6666666',
+      email: 'moderator@agriconnect.pk',
+      passwordHash: modHash,
+      role: UserRole.MODERATOR,
+      isPhoneVerified: true,
+      kycStatus: KycStatus.APPROVED,
+      profile: { create: { fullName: 'Demo Moderator', city: 'Lahore', province: 'Punjab' } },
+    },
+  });
+
+  // Platform fee: explicit row so the Admin → Settings screen shows a value.
+  // update:{} keeps whatever an admin has already set.
+  await prisma.platformSetting.upsert({
+    where: { key: 'platform_fee_pct' },
+    update: {},
+    create: { key: 'platform_fee_pct', value: '1.5' },
+  });
+
   // ─── DEMO SELLER ─────────────────────────────────────────────────────────
   const sellerHash = await bcrypt.hash('Seller@123', 10);
   const seller = await prisma.user.upsert({
@@ -377,6 +402,7 @@ async function main() {
   console.log('  Warehouse     0300-3333333    Warehouse@123');
   console.log('  Lab Agency    0300-4444444    Agency@123');
   console.log('  Transporter   0300-5555555    Transport@123');
+  console.log('  Moderator     0300-6666666    Moderator@123');
   console.log('');
 }
 
