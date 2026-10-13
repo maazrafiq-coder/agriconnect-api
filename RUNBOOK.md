@@ -59,7 +59,7 @@ Each flow is guarded so a repeat/double click cannot book twice, but if a figure
 | Symptom | Likely cause / action |
 |---|---|
 | Users get 429 "Too Many Requests" in groups | `TRUST_PROXY` not set (see §2) |
-| `P2021/P2022` "schema out of date" in responses | DB behind code: run `npx prisma migrate deploy` (or `db push` if no baseline yet) |
+| `P2021/P2022` "schema out of date" in responses | DB behind code. Set `DB_SETUP_MODE=push` on the service for ONE deploy (runs `prisma db push`, never drops data without a flag), check the log shows `[entrypoint] DB_SETUP_MODE=push`, then delete the variable |
 | Container restarts in a loop | read first boot log line: env validation error, or DB unreachable |
 | Readiness 503, liveness 200 | database down/unreachable — check Railway Postgres, `DATABASE_URL` |
 | Uploads fail | bucket env vars wrong; check logs for the S3 error with the request id |
