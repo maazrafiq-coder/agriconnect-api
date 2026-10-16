@@ -1,10 +1,10 @@
 // ─── TESTING SERVICE ──────────────────────────────────────────────────────────
 import { Injectable, NotFoundException, ForbiddenException, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { TestingStatus, PaymentStatus, NotificationType } from '@prisma/client';
+import { TestingStatus, PaymentStatus, NotificationType, VehicleType } from '@prisma/client';
 import { recordAudit } from '../common/utils/audit.util';
 import { NotificationsService } from '../notifications/notifications.service';
-import { IsString, IsNumber, IsOptional, IsArray, IsDateString, IsBoolean, IsIn, IsPositive, MinLength, Min } from 'class-validator';
+import { IsString, IsNumber, IsOptional, IsArray, IsDateString, IsBoolean, IsIn, IsPositive, MinLength, Min, IsEnum } from 'class-validator';
 import { StorageService } from '../common/storage/storage.service';
 
 export class CreateTestingRequestDto {
@@ -364,7 +364,7 @@ export class CreateTransportRequestDto {
   @IsString() deliveryCity: string;
   @IsOptional() @IsString() cargoDescription?: string;
   @IsOptional() @IsNumber() @Min(0) cargoWeightTons?: number;
-  @IsOptional() @IsString() vehicleType?: string;
+  @IsOptional() @IsEnum(VehicleType) vehicleType?: VehicleType;
   @IsOptional() @IsDateString() requiredDate?: string;
   @IsOptional() @IsString() orderId?: string;
   @IsOptional() @IsString() notes?: string;
@@ -509,7 +509,7 @@ export class TransportService {
         deliveryCity: dto.deliveryCity,
         cargoDescription: dto.cargoDescription,
         cargoWeightTons: dto.cargoWeightTons,
-        vehicleType: dto.vehicleType as any,
+        vehicleType: dto.vehicleType,
         requiredDate: dto.requiredDate ? new Date(dto.requiredDate) : null,
         orderId: dto.orderId,
         notes: dto.notes,
