@@ -4,9 +4,12 @@ import { PrismaService } from '../prisma/prisma.service';
 import { TestingStatus, PaymentStatus, NotificationType, VehicleType } from '@prisma/client';
 import { recordAudit } from '../common/utils/audit.util';
 import { NotificationsService } from '../notifications/notifications.service';
-import { IsString, IsNumber, IsOptional, IsArray, IsDateString, IsBoolean, IsIn, IsPositive, MinLength, Min, IsEnum } from 'class-validator';
+import { IsString, IsNumber, IsOptional, IsArray, IsDateString, IsBoolean, IsIn, IsPositive, MinLength, Min, IsEnum, MaxLength, Matches } from 'class-validator';
 import { StorageService } from '../common/storage/storage.service';
+import { randomUUID } from 'crypto';
+import { formatDocumentNumber } from '../common/utils/document-number.util';
 
+import { destination } from '../notifications/destinations';
 export class CreateTestingRequestDto {
   @IsString() agencyId: string;
   @IsOptional() @IsString() productId?: string;
@@ -15,6 +18,7 @@ export class CreateTestingRequestDto {
   @IsOptional() @IsDateString() scheduledDate?: string;
   @IsOptional() @IsString() sampleLocation?: string;
   @IsOptional() @IsString() notes?: string;
+  clientRequestId?: string; // set by the controller from the Idempotency-Key header
 }
 
 export class SubmitReportDto {
@@ -171,8 +175,19 @@ export class TestingService {
     const additionalServices = dto.servicesRequested.length - 1;
     const fee = basePrice + additionalServices * basePrice * 0.35;
 
-    return this.prisma.testingRequest.create({
+    if (dto.clientRequestId) {
+      const replay = await this.prisma.testingRequest.findFirst({
+        where: { requesterId, clientRequestId: dto.clientRequestId },
+        include: { agency: { include: { user: { select: { profile: { select: { fullName: true } } } } } } },
+      });
+      if (replay) return replay;
+    }
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+    const row = await tx.testingRequest.create({
       data: {
+        requestNumber: `TMP-${randomUUID()}`,
+        clientRequestId: dto.clientRequestId || null,
         requesterId,
         agencyId: dto.agencyId,
         productId: dto.productId,
@@ -184,10 +199,23 @@ export class TestingService {
         notes: dto.notes,
         status: TestingStatus.REQUESTED,
       },
-      include: {
-        agency: { include: { user: { select: { profile: { select: { fullName: true } } } } } },
-      },
     });
+    return tx.testingRequest.update({
+      where: { id: row.id },
+      data: { requestNumber: formatDocumentNumber('TST', row.requestSeq, row.createdAt) },
+      include: { agency: { include: { user: { select: { profile: { select: { fullName: true } } } } } } },
+    });
+      });
+    } catch (err: any) {
+      if (err?.code === 'P2002' && dto.clientRequestId) {
+        const replay = await this.prisma.testingRequest.findFirst({
+          where: { requesterId, clientRequestId: dto.clientRequestId },
+          include: { agency: { include: { user: { select: { profile: { select: { fullName: true } } } } } } },
+        });
+        if (replay) return replay;
+      }
+      throw err;
+    }
   }
 
   // ─── OPERATOR SELF-SERVICE ──────────────────────────────────────────────
@@ -273,7 +301,7 @@ export class TestingService {
       type: NotificationType.TESTING_UPDATE,
       title: 'Your test report is ready',
       body: 'The testing agency has submitted the report for your request.',
-      data: { link: '/buyer', requestId },
+      data: destination('/buyer', { tab: 'testing', entityType: 'testing', entityId: requestId }),
     });
     return done;
   }
@@ -347,7 +375,7 @@ export class TestingService {
         type: NotificationType.TESTING_UPDATE,
         title: `Testing request ${status.toLowerCase().replace('_', ' ')}`,
         body: `A testing request is now ${status.replace('_', ' ').toLowerCase()}.`,
-        data: { link: party === 'agency' ? '/buyer' : '/testing-portal', requestId },
+        data: destination(party === 'agency' ? '/buyer' : '/testing-portal', { tab: party === 'agency' ? 'testing' : undefined, entityType: 'testing', entityId: requestId }),
       });
     }
     return updated;
@@ -355,6 +383,8 @@ export class TestingService {
 }
 
 // ─── TRANSPORT SERVICE ────────────────────────────────────────────────────────
+const PHONE_RE = /^\+?[0-9][0-9\s-]{6,17}$/;
+
 export class CreateTransportRequestDto {
   // Optional: send the request straight to one provider for a quote.
   @IsOptional() @IsString() providerId?: string;
@@ -366,8 +396,15 @@ export class CreateTransportRequestDto {
   @IsOptional() @IsNumber() @Min(0) cargoWeightTons?: number;
   @IsOptional() @IsEnum(VehicleType) vehicleType?: VehicleType;
   @IsOptional() @IsDateString() requiredDate?: string;
+  @IsOptional() @IsDateString() deliveryDeadline?: string;
+  @IsOptional() @IsString() @MaxLength(100) commodity?: string;
+  @IsOptional() @IsString() @MaxLength(100) cargoType?: string;
+  @IsOptional() @IsString() @MaxLength(500) specialHandling?: string;
+  @IsOptional() @IsString() @MaxLength(100) contactName?: string;
+  @IsOptional() @IsString() @Matches(PHONE_RE, { message: 'Enter a valid contact phone number' }) contactPhone?: string;
   @IsOptional() @IsString() orderId?: string;
   @IsOptional() @IsString() notes?: string;
+  clientRequestId?: string; // set by the controller from the Idempotency-Key header
 }
 
 // "Book" now means: ask this provider to quote the request. The price is
@@ -377,20 +414,6 @@ export class BookTransportDto {
   @IsString() requestId: string;
   @IsString() providerId: string;
   @IsOptional() @IsNumber() @Min(0) agreedPrice?: number; // ignored; kept so older clients don't break
-}
-
-export class QuoteTransportDto {
-  @IsNumber() @IsPositive() price: number;
-  @IsOptional() @IsDateString() estimatedArrival?: string;
-  @IsOptional() @IsString() note?: string;
-}
-
-export class TrackingUpdateDto {
-  @IsOptional() @IsIn(['PICKED_UP', 'IN_TRANSIT', 'DELIVERED']) status?: 'PICKED_UP' | 'IN_TRANSIT' | 'DELIVERED';
-  @IsOptional() @IsString() currentLocation?: string;
-  @IsOptional() @IsDateString() estimatedArrival?: string;
-  @IsOptional() @IsString() driverName?: string;
-  @IsOptional() @IsString() driverPhone?: string;
 }
 
 export class TransportQueryDto {
@@ -493,200 +516,110 @@ export class TransportService {
       type: NotificationType.TRANSPORT_UPDATE,
       title: 'New transport request — quote needed',
       body: `${request.pickupCity} → ${request.deliveryCity}. Open your portal to send a price.`,
-      data: { link: '/transport-portal', requestId: request.id },
+      data: destination('/transport-portal', { entityType: 'transport', entityId: request.id }),
     });
   }
 
   async createRequest(requesterId: string, dto: CreateTransportRequestDto) {
     if (dto.providerId) await this.assertProvider(dto.providerId);
-    const created = await this.prisma.transportRequest.create({
-      data: {
-        requesterId,
-        providerId: dto.providerId,
-        pickupLocation: dto.pickupLocation,
-        pickupCity: dto.pickupCity,
-        deliveryLocation: dto.deliveryLocation,
-        deliveryCity: dto.deliveryCity,
-        cargoDescription: dto.cargoDescription,
-        cargoWeightTons: dto.cargoWeightTons,
-        vehicleType: dto.vehicleType,
-        requiredDate: dto.requiredDate ? new Date(dto.requiredDate) : null,
-        orderId: dto.orderId,
-        notes: dto.notes,
-      },
-    });
+    if (dto.orderId) {
+      // an order can only be shipped by one of its own parties
+      const order = await this.prisma.order.findUnique({ where: { id: dto.orderId }, select: { buyerId: true, sellerId: true } });
+      if (!order) throw new NotFoundException('Order not found');
+      if (order.buyerId !== requesterId && order.sellerId !== requesterId) throw new ForbiddenException('Not your order');
+    }
+    if (dto.clientRequestId) {
+      const replay = await this.prisma.transportRequest.findFirst({ where: { requesterId, clientRequestId: dto.clientRequestId } });
+      if (replay) return replay;
+    }
+    // Contact defaults to the requester's own profile when not given.
+    const requester = await this.prisma.user.findUnique({
+  where: { id: requesterId },
+  select: {
+    phoneNumber: true,
+    profile: {
+      select: { fullName: true },
+    },
+  },
+});
+
+const requesterName = requester?.profile?.fullName ?? null;
+const requesterPhone = requester?.phoneNumber ?? null;
+    if (dto.deliveryDeadline && dto.requiredDate && new Date(dto.deliveryDeadline) < new Date(dto.requiredDate)) {
+      throw new BadRequestException('The delivery deadline cannot be before the pickup date.');
+    }
+    let created;
+    try {
+      created = await this.prisma.$transaction(async (tx) => {
+        const row = await tx.transportRequest.create({
+          data: {
+            requestNumber: `TMP-${randomUUID()}`,
+            requesterId,
+            providerId: dto.providerId,
+            pickupLocation: dto.pickupLocation,
+            pickupCity: dto.pickupCity,
+            deliveryLocation: dto.deliveryLocation,
+            deliveryCity: dto.deliveryCity,
+            cargoDescription: dto.cargoDescription,
+            cargoWeightTons: dto.cargoWeightTons,
+            vehicleType: dto.vehicleType,
+            requiredDate: dto.requiredDate ? new Date(dto.requiredDate) : null,
+            deliveryDeadline: dto.deliveryDeadline ? new Date(dto.deliveryDeadline) : null,
+            commodity: dto.commodity?.trim() || null,
+            cargoType: dto.cargoType?.trim() || null,
+            specialHandling: dto.specialHandling?.trim() || null,
+            contactName: dto.contactName?.trim() || requesterName,
+            contactPhone: dto.contactPhone?.trim() || requesterPhone,
+            orderId: dto.orderId,
+            notes: dto.notes,
+            clientRequestId: dto.clientRequestId || null,
+          },
+        });
+        return tx.transportRequest.update({
+          where: { id: row.id },
+          data: { requestNumber: formatDocumentNumber('TRQ', row.requestSeq, row.createdAt) },
+        });
+      });
+    } catch (err: any) {
+      if (err?.code === 'P2002') {
+        if (dto.clientRequestId) {
+          const replay = await this.prisma.transportRequest.findFirst({ where: { requesterId, clientRequestId: dto.clientRequestId } });
+          if (replay) return replay;
+        }
+        if (dto.orderId) throw new BadRequestException('This order already has a transport request.');
+      }
+      throw err;
+    }
     if (dto.providerId) await this.notifyProvider(created, dto.providerId);
+    await recordAudit(this.prisma, requesterId, 'transport_request_created', 'transport', created.id, { requestNumber: created.requestNumber });
     return created;
   }
 
-  // Sends (or re-sends) an existing request to a provider for a quote. No
-  // price is set here — see quote() / acceptQuote().
+  // Sends (or re-sends) an existing request to a provider for a quote. No price is
+  // set here - see TransportLifecycleService.propose / accept. Any open round with a
+  // previous provider is withdrawn.
   async bookTransport(requesterId: string, dto: BookTransportDto) {
-    const request = await this.prisma.transportRequest.findUnique({ where: { id: dto.requestId } });
-    if (!request) throw new NotFoundException('Transport request not found');
-    if (request.requesterId !== requesterId) throw new ForbiddenException('Not your request');
-    if (!['REQUESTED', 'QUOTED'].includes(request.status)) {
-      throw new BadRequestException(`This request is already ${request.status.toLowerCase().replace('_', ' ')}`);
-    }
     await this.assertProvider(dto.providerId);
-
-    const updated = await this.prisma.transportRequest.update({
-      where: { id: dto.requestId },
-      data: { providerId: dto.providerId, status: 'REQUESTED', quotedPrice: null, quoteNote: null, quotedAt: null, agreedPrice: null },
-      include: {
-        provider: { include: { user: { select: { profile: { select: { fullName: true } } } } } },
-      },
+    const updated = await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT "id" FROM "transport_requests" WHERE "id" = ${dto.requestId} FOR UPDATE`;
+      const request = await tx.transportRequest.findUnique({ where: { id: dto.requestId } });
+      if (!request) throw new NotFoundException('Transport request not found');
+      if (request.requesterId !== requesterId) throw new ForbiddenException('Not your request');
+      if (!['REQUESTED', 'QUOTED'].includes(request.status)) {
+        throw new BadRequestException(`This request is already ${request.status.toLowerCase().replace('_', ' ')}`);
+      }
+      await tx.transportQuoteRound.updateMany({
+        where: { requestId: dto.requestId, status: 'CURRENT' },
+        data: { status: 'WITHDRAWN', respondedAt: new Date(), respondedById: requesterId },
+      });
+      return tx.transportRequest.update({
+        where: { id: dto.requestId },
+        data: { providerId: dto.providerId, status: 'REQUESTED', currentRoundId: null, quotedPrice: null, quoteNote: null, quotedAt: null, agreedPrice: null },
+        include: { provider: { include: { user: { select: { profile: { select: { fullName: true } } } } } } },
+      });
     });
     await this.notifyProvider(updated, dto.providerId);
     return updated;
-  }
-
-  // Provider answers a request with a price (and optional ETA / note).
-  async quote(requestId: string, providerId: string, dto: QuoteTransportDto) {
-    const request = await this.prisma.transportRequest.findUnique({ where: { id: requestId } });
-    if (!request) throw new NotFoundException('Request not found');
-    if (request.providerId !== providerId) throw new ForbiddenException('Not your request');
-    if (!['REQUESTED', 'QUOTED'].includes(request.status)) {
-      throw new BadRequestException(`A quote can't be sent while the request is ${request.status.toLowerCase().replace('_', ' ')}`);
-    }
-    const res = await this.prisma.transportRequest.updateMany({
-      where: { id: requestId, providerId, status: { in: ['REQUESTED', 'QUOTED'] as any } },
-      data: {
-        status: 'QUOTED' as any,
-        quotedPrice: dto.price,
-        quoteNote: dto.note?.trim() || null,
-        quotedAt: new Date(),
-        ...(dto.estimatedArrival && { estimatedArrival: new Date(dto.estimatedArrival) }),
-      },
-    });
-    if (res.count === 0) throw new BadRequestException('This request was just updated — refresh and try again');
-    await this.notifications.notify({
-      userId: request.requesterId,
-      type: NotificationType.TRANSPORT_UPDATE,
-      title: 'You received a transport quote',
-      body: `₨${Number(dto.price).toLocaleString()} for ${request.pickupCity} → ${request.deliveryCity}. Accept it to confirm the booking.`,
-      data: { link: '/buyer', requestId },
-    });
-    return this.prisma.transportRequest.findUnique({ where: { id: requestId } });
-  }
-
-  // Requester accepts the quote: the agreed price is the QUOTED price.
-  async acceptQuote(requestId: string, requesterId: string) {
-    const request = await this.prisma.transportRequest.findUnique({ where: { id: requestId } });
-    if (!request) throw new NotFoundException('Request not found');
-    if (request.requesterId !== requesterId) throw new ForbiddenException('Not your request');
-    if (request.status !== 'QUOTED' || request.quotedPrice == null || !request.providerId) {
-      throw new BadRequestException('There is no quote to accept on this request');
-    }
-    const res = await this.prisma.transportRequest.updateMany({
-      where: { id: requestId, status: 'QUOTED' as any, quotedPrice: request.quotedPrice },
-      data: { status: 'BOOKED' as any, agreedPrice: request.quotedPrice },
-    });
-    if (res.count === 0) throw new BadRequestException('The quote changed — review the new price and accept again');
-    await this.notifications.notify({
-      userId: request.providerId,
-      type: NotificationType.TRANSPORT_UPDATE,
-      title: 'Quote accepted — shipment booked',
-      body: `₨${Number(request.quotedPrice).toLocaleString()} for ${request.pickupCity} → ${request.deliveryCity}.`,
-      data: { link: '/transport-portal', requestId },
-    });
-    return this.prisma.transportRequest.findUnique({ where: { id: requestId } });
-  }
-
-  // Provider turns a request down; it returns to the requester unassigned
-  // so they can pick another provider.
-  async declineRequest(requestId: string, providerId: string, reason?: string) {
-    const request = await this.prisma.transportRequest.findUnique({ where: { id: requestId } });
-    if (!request) throw new NotFoundException('Request not found');
-    if (request.providerId !== providerId) throw new ForbiddenException('Not your request');
-    if (!['REQUESTED', 'QUOTED'].includes(request.status)) {
-      throw new BadRequestException('Only requests awaiting a quote or acceptance can be declined');
-    }
-    const why = (reason || '').trim();
-    if (why.length < 5) throw new BadRequestException('Give the requester a short reason (at least 5 characters)');
-    const res = await this.prisma.transportRequest.updateMany({
-      where: { id: requestId, providerId, status: { in: ['REQUESTED', 'QUOTED'] as any } },
-      data: { providerId: null, status: 'REQUESTED' as any, quotedPrice: null, quoteNote: null, quotedAt: null },
-    });
-    if (res.count === 0) throw new BadRequestException('This request was just updated — refresh and try again');
-    await this.notifications.notify({
-      userId: request.requesterId,
-      type: NotificationType.TRANSPORT_UPDATE,
-      title: 'A transporter declined your request',
-      body: `${request.pickupCity} → ${request.deliveryCity}: ${why}. You can send it to another provider.`,
-      data: { link: '/buyer', requestId },
-    });
-    return { message: 'Request declined' };
-  }
-
-  async cancelRequest(requestId: string, requesterId: string) {
-    const request = await this.prisma.transportRequest.findUnique({ where: { id: requestId } });
-    if (!request) throw new NotFoundException('Request not found');
-    if (request.requesterId !== requesterId) throw new ForbiddenException('Not your request');
-    if (!['REQUESTED', 'QUOTED', 'BOOKED'].includes(request.status)) {
-      throw new BadRequestException('This shipment has already been picked up and can no longer be cancelled');
-    }
-    const res = await this.prisma.transportRequest.updateMany({
-      where: { id: requestId, status: { in: ['REQUESTED', 'QUOTED', 'BOOKED'] as any } },
-      data: { status: 'CANCELLED' as any },
-    });
-    if (res.count === 0) throw new BadRequestException('This request was just updated — refresh and try again');
-    if (request.providerId) {
-      await this.notifications.notify({
-        userId: request.providerId,
-        type: NotificationType.TRANSPORT_UPDATE,
-        title: 'Transport request cancelled',
-        body: `${request.pickupCity} → ${request.deliveryCity} was cancelled by the requester.`,
-        data: { link: '/transport-portal', requestId },
-      });
-    }
-    return { message: 'Request cancelled' };
-  }
-
-  private static readonly TRACKING_NEXT: Record<string, string[]> = {
-    BOOKED: ['PICKED_UP'],
-    PICKED_UP: ['IN_TRANSIT', 'DELIVERED'],
-    IN_TRANSIT: ['DELIVERED'],
-  };
-
-  async updateTracking(requestId: string, providerId: string, data: TrackingUpdateDto) {
-    const request = await this.prisma.transportRequest.findUnique({ where: { id: requestId } });
-    if (!request) throw new NotFoundException('Request not found');
-    if (request.providerId !== providerId) throw new ForbiddenException('Not your shipment');
-    // Tracking only makes sense for a confirmed, live shipment — never on
-    // a request that is still being quoted, or already delivered/cancelled.
-    if (!['BOOKED', 'PICKED_UP', 'IN_TRANSIT'].includes(request.status)) {
-      throw new BadRequestException(`Tracking can't be updated while the shipment is ${request.status.toLowerCase().replace('_', ' ')}`);
-    }
-    if (data.status && !TransportService.TRACKING_NEXT[request.status]?.includes(data.status)) {
-      throw new BadRequestException(`A shipment can't move from ${request.status} to ${data.status}`);
-    }
-
-    const updateData: any = {};
-    if (data.status) updateData.status = data.status;
-    if (data.currentLocation) updateData.currentLocation = data.currentLocation;
-    if (data.estimatedArrival) updateData.estimatedArrival = new Date(data.estimatedArrival);
-    if (data.driverName) updateData.driverName = data.driverName;
-    if (data.driverPhone) updateData.driverPhone = data.driverPhone;
-    if (data.status === 'PICKED_UP') updateData.pickedUpAt = new Date();
-    if (data.status === 'DELIVERED') updateData.deliveredAt = new Date();
-
-    const res = await this.prisma.transportRequest.updateMany({
-      where: { id: requestId, status: request.status },
-      data: updateData,
-    });
-    if (res.count === 0) throw new BadRequestException('This shipment was just updated — refresh and try again');
-
-    if (data.status) {
-      await this.notifications.notify({
-        userId: request.requesterId,
-        type: NotificationType.TRANSPORT_UPDATE,
-        title: `Shipment ${data.status.toLowerCase().replace('_', ' ')}`,
-        body: `${request.pickupCity} → ${request.deliveryCity} is now ${data.status.toLowerCase().replace('_', ' ')}${data.currentLocation ? ` (${data.currentLocation})` : ''}.`,
-        data: { link: '/buyer', requestId },
-      });
-    }
-    return this.prisma.transportRequest.findUnique({ where: { id: requestId } });
   }
 
   // ─── OPERATOR SELF-SERVICE ──────────────────────────────────────────────
@@ -727,31 +660,4 @@ export class TransportService {
     return this.prisma.transportProfile.update({ where: { userId }, data: dto as any });
   }
 
-  async getMyRequests(userId: string, role: 'requester' | 'provider') {
-    const where = role === 'requester' ? { requesterId: userId } : { providerId: userId };
-    return this.prisma.transportRequest.findMany({
-      where,
-      include: {
-        requester: { select: { profile: { select: { fullName: true, city: true } } } },
-        provider: { select: { companyName: true, user: { select: { profile: { select: { fullName: true } } } } } },
-        order: { select: { id: true, offer: { select: { product: { select: { name: true } } } } } },
-      },
-      orderBy: { createdAt: 'desc' },
-    });
-  }
-
-  // Public (no login) — the driver's phone number is deliberately NOT
-  // returned here; anyone holding a shipment id could otherwise read it.
-  async track(requestId: string) {
-    const request = await this.prisma.transportRequest.findUnique({
-      where: { id: requestId },
-      select: {
-        id: true, status: true, currentLocation: true, estimatedArrival: true,
-        driverName: true, pickupCity: true, deliveryCity: true,
-        pickedUpAt: true, deliveredAt: true, trackingUrl: true,
-      },
-    });
-    if (!request) throw new NotFoundException('Shipment not found');
-    return request;
-  }
 }

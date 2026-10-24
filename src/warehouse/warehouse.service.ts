@@ -15,6 +15,7 @@ import { withBookingReference, withBookingReferences, formatBookingReference } f
 import { formatDocumentNumber } from '../common/utils/document-number.util';
 import { renderPdfDocument, PdfLineItem } from '../common/pdf/pdf.util';
 
+import { destination } from '../notifications/destinations';
 // Booking statuses that reserve warehouse capacity — a REQUESTED booking
 // isn't confirmed yet, but the tonnage is held so two buyers can't be
 // promised the same space while the operator is deciding. Released back
@@ -448,7 +449,7 @@ export class WarehouseService {
       type: NotificationType.WAREHOUSE_UPDATE,
       title: 'New storage booking request',
       body: `${withBookingReference(booking).bookingReference}: ${dto.quantityTons} tons of ${dto.commodity} for ${dto.durationDays} days at ${booking.warehouse.name}.`,
-      data: { link: '/warehouse-portal', bookingId: booking.id },
+      data: destination('/warehouse-portal', { tab: 'overview', entityType: 'booking', entityId: booking.id }),
     });
 
     // No ledger row at request time: nothing has been paid. The storage fee
@@ -522,7 +523,7 @@ export class WarehouseService {
       type: NotificationType.WAREHOUSE_UPDATE,
       title: 'Booking accepted',
       body: `${withBookingReference(updated).bookingReference} was accepted by ${updated.warehouse.name}. Deliver your goods by the entry date.`,
-      data: { link: '/warehouse', bookingId },
+      data: destination('/warehouse', { tab: 'bookings', entityType: 'booking', entityId: bookingId }),
     });
     return withBookingReference(updated);
   }
@@ -551,7 +552,7 @@ export class WarehouseService {
       type: NotificationType.WAREHOUSE_UPDATE,
       title: 'Booking declined',
       body: `${withBookingReference(updated).bookingReference} was declined by ${updated.warehouse.name}: ${dto.reason}`,
-      data: { link: '/warehouse', bookingId },
+      data: destination('/warehouse', { tab: 'bookings', entityType: 'booking', entityId: bookingId }),
     });
     return withBookingReference(updated);
   }
@@ -962,7 +963,7 @@ export class WarehouseService {
       type: NotificationType.WAREHOUSE_UPDATE,
       title: kind === 'INFO_REQUEST' ? 'Warehouse needs more information' : 'New message on your booking',
       body: `${ref}: ${body.length > 120 ? body.slice(0, 117) + '…' : body}`,
-      data: { link: isOperator ? '/warehouse' : '/warehouse-portal', bookingId },
+      data: destination(isOperator ? '/warehouse' : '/warehouse-portal', { tab: isOperator ? 'bookings' : 'overview', entityType: 'booking', entityId: bookingId }),
     });
     return created;
   }
@@ -1013,7 +1014,7 @@ export class WarehouseService {
       type: NotificationType.WAREHOUSE_UPDATE,
       title: 'Release of your goods requested',
       body: `${booking.warehouse.name} has requested your approval to release ${created.quantityTons} tons of ${booking.commodity}.`,
-      data: { link: '/warehouse', bookingId },
+      data: destination('/warehouse', { tab: 'bookings', entityType: 'booking', entityId: bookingId }),
     });
     return created;
   }
@@ -1071,7 +1072,7 @@ export class WarehouseService {
       type: NotificationType.WAREHOUSE_UPDATE,
       title: 'Gate-out approved',
       body: `${passNumber} was approved for ${pass.quantityTons} tons of ${pass.booking.commodity}. You can release the goods.`,
-      data: { link: '/warehouse-portal', bookingId: pass.bookingId },
+      data: destination('/warehouse-portal', { tab: 'gateout', entityType: 'gateout', entityId: pass.id }),
     });
     return approved;
   }
@@ -1093,7 +1094,7 @@ export class WarehouseService {
       type: NotificationType.WAREHOUSE_UPDATE,
       title: 'Gate-out request rejected',
       body: `The release request was rejected${rejectionNote ? `: ${rejectionNote}` : '.'}`,
-      data: { link: '/warehouse-portal', bookingId: pass.bookingId },
+      data: destination('/warehouse-portal', { tab: 'gateout', entityType: 'gateout', entityId: pass.id }),
     });
     return rejected;
   }
@@ -1240,21 +1241,21 @@ export class WarehouseService {
         type: NotificationType.LOAN_UPDATE,
         title: 'Loan application on stored goods',
         body: `${ownerName} applied for a ₨${dto.loanAmount.toLocaleString()} loan from ${dto.bankName} against receipt ${receipt.receiptNumber} (${receipt.commodity}, ${receipt.quantityTons} t). Do not release these goods — gate-out is blocked while the application is pending and while any lien is active.`,
-        data: { link: '/warehouse-portal', receiptId: receipt.id, lienId: lien.id },
+        data: destination('/warehouse-portal', { tab: 'overview', entityType: 'lien', entityId: lien.id }),
       },
       {
         userId: ownerId,
         type: NotificationType.LOAN_UPDATE,
         title: 'Loan application submitted',
         body: `Your application for ₨${dto.loanAmount.toLocaleString()} from ${dto.bankName} against receipt ${receipt.receiptNumber} is awaiting confirmation. The goods are on hold at ${receipt.warehouse.name} until it is decided. You can withdraw it any time before confirmation.`,
-        data: { link: '/warehouse', receiptId: receipt.id, lienId: lien.id },
+        data: destination('/warehouse', { tab: 'receipts', entityType: 'lien', entityId: lien.id }),
       },
       ...reviewers.map((r) => ({
         userId: r.id,
         type: NotificationType.LOAN_UPDATE,
         title: 'Loan application awaiting confirmation',
         body: `${ownerName} — ₨${dto.loanAmount.toLocaleString()} from ${dto.bankName} against receipt ${receipt.receiptNumber}.`,
-        data: { link: '/admin', lienId: lien.id },
+        data: destination('/admin', { entityType: 'lien', entityId: lien.id }),
       })),
     ]);
 
@@ -1299,7 +1300,7 @@ export class WarehouseService {
       type: NotificationType.LOAN_UPDATE,
       title: 'Loan application withdrawn',
       body: `The loan application on receipt ${lien.receipt.receiptNumber} was withdrawn. The hold on these goods is lifted.`,
-      data: { link: '/warehouse-portal', receiptId: lien.receiptId },
+      data: destination('/warehouse-portal', { tab: 'overview', entityType: 'lien', entityId: lien.id }),
     });
     return { message: 'Application withdrawn. Your goods are no longer on hold.' };
   }
@@ -1368,14 +1369,14 @@ export class WarehouseService {
         type: NotificationType.LOAN_UPDATE,
         title: 'Loan confirmed — goods under bank lien',
         body: `${lien.bankName} loan of ₨${Number(lien.loanAmount).toLocaleString()} confirmed (ref ${ref}). Receipt ${lien.receipt.receiptNumber} is now under bank lien until the bank records clearance.`,
-        data: { link: '/warehouse', receiptId: lien.receiptId },
+        data: destination('/warehouse', { tab: 'receipts', entityType: 'lien', entityId: lien.id }),
       },
       {
         userId: lien.receipt.warehouse.userId,
         type: NotificationType.LOAN_UPDATE,
         title: 'Bank lien is now active',
         body: `The ${lien.bankName} lien on receipt ${lien.receipt.receiptNumber} is confirmed (ref ${ref}). Do not release these goods until the bank's clearance is recorded.`,
-        data: { link: '/warehouse-portal', receiptId: lien.receiptId },
+        data: destination('/warehouse-portal', { tab: 'overview', entityType: 'lien', entityId: lien.id }),
       },
     ]);
     return { message: 'Lien confirmed and activated.' };
@@ -1413,14 +1414,14 @@ export class WarehouseService {
         type: NotificationType.LOAN_UPDATE,
         title: 'Loan application declined',
         body: `Your ${lien.bankName} application on receipt ${lien.receipt.receiptNumber} was declined: ${reason}. Your goods are no longer on hold.`,
-        data: { link: '/warehouse', receiptId: lien.receiptId },
+        data: destination('/warehouse', { tab: 'receipts', entityType: 'lien', entityId: lien.id }),
       },
       {
         userId: lien.receipt.warehouse.userId,
         type: NotificationType.LOAN_UPDATE,
         title: 'Loan application declined',
         body: `The loan application on receipt ${lien.receipt.receiptNumber} was declined. The hold on these goods is lifted.`,
-        data: { link: '/warehouse-portal', receiptId: lien.receiptId },
+        data: destination('/warehouse-portal', { tab: 'overview', entityType: 'lien', entityId: lien.id }),
       },
     ]);
     return { message: 'Application declined. The goods are released from hold.' };
@@ -1478,14 +1479,14 @@ export class WarehouseService {
         type: NotificationType.LOAN_UPDATE,
         title: 'Bank lien cleared',
         body: `${lien.bankName} has cleared the lien on receipt ${lien.receipt.receiptNumber} (ref: ${reference}). Your goods are free to be released.`,
-        data: { link: '/warehouse', receiptId: lien.receiptId },
+        data: destination('/warehouse', { tab: 'receipts', entityType: 'lien', entityId: lien.id }),
       },
       {
         userId: lien.receipt.warehouse.userId,
         type: NotificationType.LOAN_UPDATE,
         title: 'Bank lien cleared',
         body: `Clearance recorded for receipt ${lien.receipt.receiptNumber} (${lien.bankName}, ref: ${reference}). Gate-out can now be requested.`,
-        data: { link: '/warehouse-portal', receiptId: lien.receiptId },
+        data: destination('/warehouse-portal', { tab: 'overview', entityType: 'lien', entityId: lien.id }),
       },
     ]);
 

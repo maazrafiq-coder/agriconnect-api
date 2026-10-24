@@ -6,6 +6,7 @@ import { recordAudit } from '../common/utils/audit.util';
 import { NotificationsService } from '../notifications/notifications.service';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 
+import { destination } from '../notifications/destinations';
 @Injectable()
 export class UsersService {
   constructor(private prisma: PrismaService, private notifications: NotificationsService) {}
@@ -226,7 +227,7 @@ export class UsersService {
       body: status === 'APPROVED'
         ? 'You can now list, make offers and use every service on AgriConnect.'
         : `Reason: ${note || 'not provided'}. Contact support if you think this is a mistake.`,
-      data: { link: '/account' },
+      data: destination('/account', { tab: 'profile', entityType: 'kyc', entityId: userId }),
     });
     return user;
   }

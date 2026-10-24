@@ -3,9 +3,9 @@ import { OffersService, OrdersService } from './offers.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { SettingsService } from '../settings/settings.service';
 import { NotificationsService } from '../notifications/notifications.service';
-import { OfferStatus, OrderStatus, ProductStatus } from '@prisma/client';
+import { OrderStatus } from '@prisma/client';
+import { makeFakePrisma } from './__testing__/fake-prisma';
 
-const future = () => new Date(Date.now() + 3600_000);
 
 describe('In-app notifications — offers & orders', () => {
   let offers: OffersService;
@@ -36,39 +36,58 @@ describe('In-app notifications — offers & orders', () => {
     orders = ref.get(OrdersService);
   });
 
-  it('a new offer notifies the SELLER (OFFER_RECEIVED)', async () => {
-    prisma.product.findUnique.mockResolvedValue({ id: 'p', name: 'Rice', unit: 'kg', sellerId: 'seller-1', status: ProductStatus.ACTIVE, minOrderQty: 1, quantity: 100 });
-    prisma.offer.create.mockResolvedValue({ id: 'o1', buyer: { profile: { fullName: 'Ali' } } });
-    await offers.create('buyer-1', { productId: 'p', offeredPrice: 100, quantity: 10 } as any);
-    expect(notifications.notify).toHaveBeenCalledWith(expect.objectContaining({ userId: 'seller-1', type: 'OFFER_RECEIVED' }));
-  });
+  describe('negotiation (stateful)', () => {
+    let db: any;
+    beforeEach(async () => {
+      db = makeFakePrisma();
+      db.user.seed({ id: 'seller-1' }); db.user.seed({ id: 'buyer-1' });
+      db.product.seed({ id: 'p', sellerId: 'seller-1', name: 'Rice', unit: 'kg', quantity: 100, minOrderQty: 1, paymentTerms: { type: 'COD' } });
+      const ref = await Test.createTestingModule({
+        providers: [
+          OffersService,
+          { provide: PrismaService, useValue: db },
+          { provide: SettingsService, useValue: { getPlatformFeePct: jest.fn().mockResolvedValue(1.5) } },
+          { provide: NotificationsService, useValue: notifications },
+        ],
+      }).compile();
+      offers = ref.get(OffersService);
+    });
+    const newOffer = () => offers.create('buyer-1', { productId: 'p', offeredPrice: 100, quantity: 10, acceptTerms: true } as any);
 
-  it('a counter notifies the BUYER', async () => {
-    prisma.offer.findUnique.mockResolvedValue({ id: 'o1', buyerId: 'buyer-1', status: OfferStatus.PENDING, expiresAt: future(), product: { sellerId: 'seller-1', name: 'Rice' } });
-    prisma.offer.update.mockResolvedValue({ id: 'o1' });
-    await offers.counter('o1', 'seller-1', { counterPrice: 120 } as any);
-    expect(notifications.notify).toHaveBeenCalledWith(expect.objectContaining({ userId: 'buyer-1', title: expect.stringMatching(/counter/i) }));
-  });
+    it('a new offer notifies the SELLER (OFFER_RECEIVED) with the terms and a deep link', async () => {
+      const o: any = await newOffer();
+      expect(notifications.notify).toHaveBeenCalledWith(expect.objectContaining({
+        userId: 'seller-1', type: 'OFFER_RECEIVED', body: expect.stringMatching(/Cash on delivery/),
+        data: expect.objectContaining({ route: '/seller', tab: 'offers', entityType: 'offer', entityId: o.id }),
+      }));
+    });
 
-  it('a decline notifies the BUYER (OFFER_REJECTED); a withdraw notifies the SELLER', async () => {
-    prisma.offer.findUnique.mockResolvedValue({ id: 'o1', buyerId: 'buyer-1', status: OfferStatus.PENDING, product: { sellerId: 'seller-1', name: 'Rice' } });
-    await offers.reject('o1', 'seller-1', 'too low');
-    expect(notifications.notify).toHaveBeenLastCalledWith(expect.objectContaining({ userId: 'buyer-1', type: 'OFFER_REJECTED' }));
-    await offers.withdraw('o1', 'buyer-1');
-    expect(notifications.notify).toHaveBeenLastCalledWith(expect.objectContaining({ userId: 'seller-1' }));
-  });
+    it('a counter notifies the OTHER party (seller counter -> buyer, buyer counter-back -> seller)', async () => {
+      const o: any = await newOffer();
+      await offers.counter(o.id, 'seller-1', { counterPrice: 120 } as any);
+      expect(notifications.notify).toHaveBeenLastCalledWith(expect.objectContaining({ userId: 'buyer-1', title: expect.stringMatching(/counter/i) }));
+      await offers.propose(o.id, 'buyer-1', { price: 110 });
+      expect(notifications.notify).toHaveBeenLastCalledWith(expect.objectContaining({ userId: 'seller-1', title: expect.stringMatching(/counter/i) }));
+    });
 
-  it('seller accepting notifies the buyer; buyer accepting a counter notifies the seller', async () => {
-    const offer = { id: 'o1', productId: 'p', buyerId: 'buyer-1', quantity: 10, status: OfferStatus.PENDING, offeredPrice: 100, expiresAt: future(), product: { sellerId: 'seller-1' } };
-    prisma.offer.findUnique.mockResolvedValue(offer);
-    prisma.product.updateMany.mockResolvedValue({ count: 1 });
-    prisma.product.findUnique.mockResolvedValue({ quantity: 50 });
-    prisma.order = { ...prisma.order, create: jest.fn().mockResolvedValue({ id: 'ord1' }) };
-    await offers.accept('o1', 'seller-1');
-    expect(notifications.notify).toHaveBeenLastCalledWith(expect.objectContaining({ userId: 'buyer-1', type: 'OFFER_ACCEPTED' }));
-    prisma.offer.findUnique.mockResolvedValue({ ...offer, status: OfferStatus.COUNTERED, counterPrice: 120 });
-    await offers.acceptCounter('o1', 'buyer-1');
-    expect(notifications.notify).toHaveBeenLastCalledWith(expect.objectContaining({ userId: 'seller-1', type: 'OFFER_ACCEPTED' }));
+    it('a decline notifies the BUYER (OFFER_REJECTED); a withdraw notifies the SELLER', async () => {
+      const o: any = await newOffer();
+      await offers.reject(o.id, 'seller-1', 'too low');
+      expect(notifications.notify).toHaveBeenLastCalledWith(expect.objectContaining({ userId: 'buyer-1', type: 'OFFER_REJECTED' }));
+      const o2: any = await newOffer();
+      await offers.withdraw(o2.id, 'buyer-1');
+      expect(notifications.notify).toHaveBeenLastCalledWith(expect.objectContaining({ userId: 'seller-1' }));
+    });
+
+    it('seller accepting notifies the buyer; buyer accepting a counter notifies the seller', async () => {
+      const o: any = await newOffer();
+      await offers.accept(o.id, 'seller-1', { acceptTerms: true });
+      expect(notifications.notify).toHaveBeenLastCalledWith(expect.objectContaining({ userId: 'buyer-1', type: 'OFFER_ACCEPTED' }));
+      const o2: any = await newOffer();
+      await offers.counter(o2.id, 'seller-1', { counterPrice: 120 } as any);
+      await offers.acceptCounter(o2.id, 'buyer-1', { acceptTerms: true });
+      expect(notifications.notify).toHaveBeenLastCalledWith(expect.objectContaining({ userId: 'seller-1', type: 'OFFER_ACCEPTED' }));
+    });
   });
 
   it('an order status change notifies the OTHER party only', async () => {

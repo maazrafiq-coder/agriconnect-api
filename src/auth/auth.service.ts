@@ -150,25 +150,24 @@ export class AuthService {
     if (!passwordValid) throw new UnauthorizedException('Invalid credentials');
     if (!user.isActive) throw new UnauthorizedException('This account has been suspended. Contact support.');
 
-    // Registration approval gate — the account must be admin-approved
-    // before it can be used, per the required flow. Accounts admins create
-    // directly are auto-approved (see adminCreateUser below), so this only
-    // blocks self-registered accounts still awaiting review.
+    // Registration approval gate.
     //
-    // INFO_REQUESTED is a deliberate exception: an admin has asked this
-    // user for more information, and they can't provide it (or see why it
-    // was asked) if they're locked out of the account entirely. So these
-    // users ARE allowed to log in — they just can't transact yet (see
-    // OffersService.assertCanTransact) until an admin actually approves
-    // the account.
-    if (user.kycStatus !== 'APPROVED' && user.kycStatus !== 'INFO_REQUESTED') {
-      const statusMessage = ({
-        PENDING: 'Please verify your OTP first.',
-        SUBMITTED: 'Your registration is pending admin review. You will be able to log in once approved.',
-        RECOMMENDED: 'Your registration has been reviewed and is awaiting final admin approval.',
-        REJECTED: `Your registration was not approved.${user.kycRejectionNote ? ' Reason: ' + user.kycRejectionNote : ''}`,
-      } as Record<string, string>)[user.kycStatus] || 'Your account is not yet approved for login.';
-      throw new ForbiddenException(statusMessage);
+    // A person who has verified their OTP can log in while their
+    // registration is still under review (SUBMITTED / RECOMMENDED), after an
+    // admin asked for more information (INFO_REQUESTED) or after a
+    // rejection (REJECTED, so they can read the reason and re-submit
+    // documents). Such a session is LIMITED: browsing and account/KYC
+    // actions only. Every transactional route is protected server-side by
+    // ApprovedUserGuard, so nothing here depends on what the frontend shows.
+    //
+    // Only an account that never completed OTP verification (PENDING) is
+    // refused - it has no session at all, just a registration token.
+    if (!SESSION_ALLOWED_KYC.includes(user.kycStatus)) {
+      throw new ForbiddenException(
+        user.kycStatus === 'PENDING'
+          ? 'Please verify your OTP first.'
+          : 'Your account is not available for login. Contact support.',
+      );
     }
 
     await this.writeAuditLog(user.id, 'login', 'user', user.id);
@@ -177,6 +176,9 @@ export class AuthService {
     return {
       message: 'Login successful',
       user: this.sanitizeUser(user),
+      // true until an admin approves the account - the frontend uses this to
+      // show the status banner and explain disabled actions.
+      limitedAccess: user.kycStatus !== 'APPROVED',
       ...tokens,
     };
   }

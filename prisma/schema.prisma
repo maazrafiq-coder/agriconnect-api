@@ -124,6 +124,25 @@ enum OfferStatus {
   WITHDRAWN
 }
 
+// Phase 2: one row per proposal in an offer negotiation. Exactly one round per
+// offer is CURRENT (enforced by a partial unique index in the SQL migration and
+// by a row lock in OffersService).
+enum OfferRoundStatus {
+  CURRENT
+  SUPERSEDED   // replaced by a newer round
+  ACCEPTED
+  DECLINED     // recipient said no
+  WITHDRAWN    // proposer took it back
+  EXPIRED
+}
+
+enum SellerInvoiceStatus {
+  ISSUED
+  PAYMENT_SUBMITTED
+  PAYMENT_CONFIRMED
+  VOID
+}
+
 enum OrderStatus {
   PENDING
   CONFIRMED
@@ -228,6 +247,10 @@ enum TransportStatus {
   PICKED_UP
   IN_TRANSIT
   DELIVERED
+  // Phase 3: COMPLETED = the requester acknowledged delivery; DISPUTED = an open
+  // dispute freezes the shipment (the pre-dispute status is kept in statusBeforeDispute).
+  COMPLETED
+  DISPUTED
   CANCELLED
 }
 
@@ -286,10 +309,36 @@ model ReviewClarification {
   updatedAt       DateTime @updatedAt
 
   attachments     ClarificationAttachment[]
+  // Phase 1: the real conversation. requestMessage/responseMessage/respondedAt
+  // above stay as a denormalised "first request" / "latest subject reply"
+  // summary so older readers keep working; messages[] is the source of truth.
+  messages        ReviewClarificationMessage[]
 
   @@index([subjectType, subjectId])
   @@index([status])
   @@map("review_clarifications")
+}
+
+// Phase 1: one row per message in a clarification thread, in either
+// direction. Before this a clarification held ONE response column, so a
+// second reply overwrote the first and the sender could not see what they
+// had sent. clientRequestId makes a retried / double-clicked submit
+// idempotent: the same (clarification, clientRequestId) can only exist once.
+model ReviewClarificationMessage {
+  id              String   @id @default(uuid())
+  clarificationId String
+  senderId        String
+  senderRole      String   // 'REVIEWER' (admin/moderator) | 'SUBJECT' (the person under review)
+  body            String
+  clientRequestId String?
+  createdAt       DateTime @default(now())
+
+  clarification   ReviewClarification @relation(fields: [clarificationId], references: [id], onDelete: Cascade)
+  attachments     ClarificationAttachment[]
+
+  @@unique([clarificationId, clientRequestId], map: "rcm_clarificationId_clientRequestId_key")
+  @@index([clarificationId, createdAt], map: "rcm_clarificationId_createdAt_idx")
+  @@map("review_clarification_messages")
 }
 
 model ClarificationAttachment {
@@ -300,9 +349,14 @@ model ClarificationAttachment {
   s3Key           String   // server-generated on-disk filename — never user input
   createdAt       DateTime @default(now())
 
+  // Phase 1: which message this file was sent with (null = legacy rows).
+  messageId       String?
+
   clarification   ReviewClarification @relation(fields: [clarificationId], references: [id], onDelete: Cascade)
+  message         ReviewClarificationMessage? @relation(fields: [messageId], references: [id], onDelete: SetNull)
 
   @@index([clarificationId])
+  @@index([messageId])
   @@map("clarification_attachments")
 }
 
@@ -358,6 +412,8 @@ model User {
   offersAsBuyer     Offer[]          @relation("BuyerOffers")
   ordersAsSeller    Order[]          @relation("SellerOrders")
   ordersAsBuyer     Order[]          @relation("BuyerOrders")
+  invoicesIssued    SellerInvoice[]  @relation("SellerInvoiceSeller")
+  invoicesReceived  SellerInvoice[]  @relation("SellerInvoiceBuyer")
 
   // ── Storage relations (User as depositor / owner) ─────────────────────────
   storageBookings   StorageBooking[]
@@ -371,6 +427,9 @@ model User {
   // ── Testing / transport as requester ─────────────────────────────────────
   testingRequests   TestingRequest[]  @relation("TestingRequester")
   transportRequests TransportRequest[] @relation("TransportRequester")
+  transportInvoicesIssued   TransportInvoice[] @relation("TransportInvoiceProvider")
+  transportInvoicesReceived TransportInvoice[] @relation("TransportInvoiceRequester")
+  transportDisputesRaised   TransportDispute[] @relation("TransportDisputeRaiser")
 
   // ── Messaging & social ───────────────────────────────────────────────────
   messagesSent      Message[]         @relation("MessageSender")
@@ -491,6 +550,8 @@ model Product {
   harvestDate      DateTime?
   packagingType    String?
   deliveryTerms    String?
+  // Phase 2: seller's default payment terms (see src/offers/terms/payment-terms.ts)
+  paymentTerms     Json?
   status           ProductStatus   @default(DRAFT)
   rejectionNote    String?         // set by admin when status = REJECTED
   viewCount        Int             @default(0)
@@ -601,6 +662,10 @@ model Offer {
   counterMessage String?
   rejectionReason String?
   expiresAt      DateTime?
+  // Phase 2: legacy columns above mirror the negotiation (offeredPrice = latest
+  // buyer proposal, counterPrice = latest seller proposal, quantity = current
+  // round); the full history lives in OfferRound.
+  currentRoundId String?
   createdAt      DateTime    @default(now())
   updatedAt      DateTime    @updatedAt
 
@@ -608,6 +673,7 @@ model Offer {
   buyer          User        @relation("BuyerOffers", fields: [buyerId], references: [id])
   order          Order?
   messages       OfferMessage[]
+  rounds         OfferRound[]
 
   @@index([productId])
   @@index([buyerId])
@@ -615,6 +681,35 @@ model Offer {
   @@map("offers")
   @@index([buyerId, status])
   @@index([status, expiresAt])
+}
+
+// Phase 2: one proposal (price, quantity, payment terms) in a negotiation.
+model OfferRound {
+  id              String           @id @default(uuid())
+  offerId         String
+  roundNo         Int
+  proposerId      String
+  proposerRole    String           // 'BUYER' | 'SELLER'
+  price           Decimal          @db.Decimal(14, 2)
+  quantity        Float
+  paymentTerms    Json?            // null only on rounds back-filled from pre-Phase-2 offers
+  message         String?
+  status          OfferRoundStatus @default(CURRENT)
+  supersededById  String?
+  expiresAt       DateTime?
+  respondedAt     DateTime?
+  respondedById   String?
+  termsAcceptedAt DateTime?        // set when the accepting party explicitly accepted these terms
+  clientRequestId String?          // Idempotency-Key replay protection
+  createdAt       DateTime         @default(now())
+
+  offer           Offer            @relation(fields: [offerId], references: [id], onDelete: Cascade)
+
+  @@unique([offerId, roundNo])
+  @@unique([offerId, clientRequestId])
+  @@index([offerId, status])
+  // SQL migration also adds: UNIQUE (offerId) WHERE status = 'CURRENT'
+  @@map("offer_rounds")
 }
 
 // Seller <-> buyer conversation about one offer.
@@ -649,9 +744,19 @@ model Order {
   completedAt     DateTime?
   cancelledAt     DateTime?
   cancelReason    String?
+  // Phase 2: what was actually agreed (the accepted OfferRound). The terms
+  // snapshot is immutable once set (service never updates it; a DB trigger in
+  // the SQL migration rejects changes).
+  unitPrice            Decimal?  @db.Decimal(14, 2)
+  quantity             Float?
+  paymentTermsSnapshot Json?
+  termsAcceptedAt      DateTime?
+  termsAcceptedById    String?
+  acceptedRoundId      String?
   createdAt       DateTime      @default(now())
   updatedAt       DateTime      @updatedAt
 
+  sellerInvoices     SellerInvoice[]
   offer              Offer               @relation(fields: [offerId], references: [id])
   seller             User                @relation("SellerOrders", fields: [sellerId], references: [id])
   buyer              User                @relation("BuyerOrders", fields: [buyerId], references: [id])
@@ -670,6 +775,56 @@ model Order {
   @@map("orders")
   @@index([sellerId, status])
   @@index([buyerId, status])
+}
+
+// Phase 2: invoice a seller issues to the buyer for an order. The buyer owes
+// the FULL order amount (D5); platform fee and seller net are a separate
+// seller-side section that is never shown to the buyer. At most one
+// non-VOID invoice per order (partial unique index in the SQL migration +
+// order row lock in the service).
+model SellerInvoice {
+  id                   String              @id @default(uuid())
+  invoiceSeq           Int                 @unique @default(autoincrement())
+  invoiceNumber        String              @unique
+  orderId              String
+  sellerId             String
+  buyerId              String
+  status               SellerInvoiceStatus @default(ISSUED)
+  version              Int                 @default(1)
+  orderAmount          Decimal             @db.Decimal(16, 2)
+  unitPrice            Decimal             @db.Decimal(14, 2)
+  quantity             Float
+  itemDescription      String
+  platformFeePct       Decimal             @db.Decimal(5, 2)
+  platformFee          Decimal             @db.Decimal(14, 2)
+  sellerNet            Decimal             @db.Decimal(14, 2)
+  paymentTermsSnapshot Json?
+  schedule             Json
+  dueDate              DateTime?
+  s3Key                String?
+  paymentReference     String?
+  paymentNote          String?
+  paymentSubmittedAt   DateTime?
+  paymentSubmittedById String?
+  paymentConfirmedAt   DateTime?
+  paymentConfirmedById String?
+  paymentRejectedNote  String?
+  voidedAt             DateTime?
+  voidedById           String?
+  voidReason           String?
+  replacesId           String?
+  issuedAt             DateTime            @default(now())
+  createdAt            DateTime            @default(now())
+
+  order  Order @relation(fields: [orderId], references: [id])
+  seller User  @relation("SellerInvoiceSeller", fields: [sellerId], references: [id])
+  buyer  User  @relation("SellerInvoiceBuyer", fields: [buyerId], references: [id])
+
+  @@index([orderId])
+  @@index([sellerId, status])
+  @@index([buyerId, status])
+  // SQL migration also adds: UNIQUE (orderId) WHERE status <> 'VOID'
+  @@map("seller_invoices")
 }
 
 model OrderStatusHistory {
@@ -1058,6 +1213,10 @@ model TestingAgencyProfile {
 
 model TestingRequest {
   id                 String        @id @default(uuid())
+  // Phase 4: human-readable reference TST-YYYY-nnnnnn + idempotency key.
+  requestSeq         Int           @unique @default(autoincrement())
+  requestNumber      String        @unique
+  clientRequestId    String?
   requesterId        String        // FK → User.id (who requested the test)
   agencyId           String        // FK → TestingAgencyProfile.userId
   productId          String?
@@ -1084,6 +1243,7 @@ model TestingRequest {
   agency             TestingAgencyProfile @relation(fields: [agencyId], references: [userId])
   order              Order?               @relation(fields: [orderId], references: [id])
 
+  @@unique([requesterId, clientRequestId])
   @@index([requesterId])
   @@index([agencyId])
   @@index([status])
@@ -1122,6 +1282,9 @@ model TransportProfile {
 
 model TransportRequest {
   id               String          @id @default(uuid())
+  // Phase 3: human-readable reference TRQ-YYYY-nnnnnn (same pattern as SINV-/WHB-).
+  requestSeq       Int             @unique @default(autoincrement())
+  requestNumber    String          @unique
   requesterId      String          // FK → User.id (who requested transport)
   providerId       String?         // FK → TransportProfile.userId
   orderId          String?         @unique
@@ -1147,21 +1310,208 @@ model TransportRequest {
   deliveredAt      DateTime?
   driverName       String?
   driverPhone      String?
+  vehicleRegNo     String?
+  driverUpdatedAt  DateTime?
   notes            String?
+  // Phase 3: quote rounds, agreed round, delivery acknowledgement, dispute freeze.
+  currentRoundId   String?
+  agreedRoundId    String?
+  clientRequestId  String?
+  acknowledgedAt   DateTime?
+  acknowledgedById String?
+  acknowledgementNote String?
+  statusBeforeDispute TransportStatus?
+  // Phase 4 (brief §10): richer request, confirmed transport ORDER reference (TRO-),
+  // agreed-terms snapshot (immutable, DB trigger) and delivery evidence.
+  deliveryDeadline    DateTime?
+  commodity           String?
+  cargoType           String?
+  specialHandling     String?
+  contactName         String?
+  contactPhone        String?
+  orderSeq            Int?      @unique
+  orderNumber         String?   @unique
+  orderConfirmedAt    DateTime?
+  paymentTermsSnapshot Json?
+  agreedCharges       Json?
+  agreedConditions    String?
+  agreedPickupAt      DateTime?
+  termsAcceptedAt     DateTime?
+  termsAcceptedById   String?
+  deliveryReceiverName String?
+  deliveryNote        String?
+  deliveredQuantityTons Float?
   createdAt        DateTime        @default(now())
   updatedAt        DateTime        @updatedAt
+
+  quoteRounds      TransportQuoteRound[]
+  invoices         TransportInvoice[]
+  disputes         TransportDispute[]
 
   // FIX 2: requester is a plain User; provider is a TransportProfile
   requester        User             @relation("TransportRequester", fields: [requesterId], references: [id])
   provider         TransportProfile? @relation(fields: [providerId], references: [userId])
   order            Order?           @relation(fields: [orderId], references: [id])
 
+  @@unique([requesterId, clientRequestId])
   @@index([requesterId])
   @@index([providerId])
   @@index([status])
   @@map("transport_requests")
   @@index([providerId, status])
   @@index([requesterId, status])
+}
+
+// ─── TRANSPORT PHASE 3 ────────────────────────────────────────────────────────
+// Negotiation on a transport request. Exactly one CURRENT round per request
+// (partial unique index in the SQL migration + a row lock in the service).
+// proposerRole PROVIDER = a quote, REQUESTER = a counter-offer. Accepting the
+// CURRENT round (by the other party) books the shipment at that price.
+enum TransportQuoteStatus {
+  CURRENT
+  SUPERSEDED
+  ACCEPTED
+  DECLINED
+  WITHDRAWN
+  EXPIRED
+}
+
+model TransportQuoteRound {
+  id               String               @id @default(uuid())
+  requestId        String
+  providerId       String               // the provider this round was negotiated with
+  roundNo          Int
+  proposerId       String
+  proposerRole     String               // 'PROVIDER' | 'REQUESTER'
+  price            Decimal              @db.Decimal(14, 2)   // base freight
+  // Phase 4: extra charges ([{label, amount}]) and the server-computed all-in total.
+  additionalCharges Json?
+  totalPrice       Decimal              @db.Decimal(14, 2)   // price + additional charges (what is agreed)
+  estimatedPickup  DateTime?
+  estimatedArrival DateTime?
+  vehicleDetails   String?
+  paymentTerms     Json?
+  conditions       String?
+  message          String?
+  status           TransportQuoteStatus @default(CURRENT)
+  supersededById   String?
+  expiresAt        DateTime?
+  respondedAt      DateTime?
+  respondedById    String?
+  clientRequestId  String?
+  createdAt        DateTime             @default(now())
+
+  request TransportRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  @@unique([requestId, roundNo])
+  @@unique([requestId, clientRequestId])
+  @@index([requestId, status])
+  // SQL migration also adds: UNIQUE (requestId) WHERE status = 'CURRENT'
+  @@map("transport_quote_rounds")
+}
+
+enum TransportInvoiceStatus {
+  ISSUED
+  PAYMENT_SUBMITTED
+  PAYMENT_CONFIRMED
+  VOID
+}
+
+// The provider's invoice to the requester for a delivered shipment. The amount
+// is the AGREED price of the accepted round - never client supplied. There is no
+// platform fee on transport. At most one non-VOID invoice per shipment.
+model TransportInvoice {
+  id                   String                 @id @default(uuid())
+  invoiceSeq           Int                    @unique @default(autoincrement())
+  invoiceNumber        String                 @unique
+  requestId            String
+  providerId           String
+  requesterId          String
+  status               TransportInvoiceStatus @default(ISSUED)
+  version              Int                    @default(1)
+  amount               Decimal                @db.Decimal(16, 2)
+  description          String
+  // Phase 4: due date follows the agreed payment terms snapshot (null while open-ended,
+  // e.g. credit counted from delivery acknowledgement); orderNumber = the TRO- reference.
+  orderNumber          String?
+  paymentTermsSnapshot Json?
+  dueDate              DateTime?
+  s3Key                String?
+  paymentReference     String?
+  paymentNote          String?
+  paymentSubmittedAt   DateTime?
+  paymentSubmittedById String?
+  paymentConfirmedAt   DateTime?
+  paymentConfirmedById String?
+  paymentRejectedNote  String?
+  voidedAt             DateTime?
+  voidedById           String?
+  voidReason           String?
+  replacesId           String?
+  issuedAt             DateTime               @default(now())
+  createdAt            DateTime               @default(now())
+
+  request   TransportRequest @relation(fields: [requestId], references: [id])
+  provider  User             @relation("TransportInvoiceProvider", fields: [providerId], references: [id])
+  requester User             @relation("TransportInvoiceRequester", fields: [requesterId], references: [id])
+
+  @@index([requestId])
+  @@index([providerId, status])
+  @@index([requesterId, status])
+  // SQL migration also adds: UNIQUE (requestId) WHERE status <> 'VOID'
+  @@map("transport_invoices")
+}
+
+enum TransportDisputeCategory {
+  DAMAGED_CARGO
+  SHORTAGE
+  LATE_DELIVERY
+  NOT_DELIVERED
+  PRICE_MISMATCH
+  OTHER
+}
+
+enum TransportDisputeStatus {
+  OPEN
+  RESPONDED
+  RESOLVED
+  WITHDRAWN
+}
+
+// A dispute on a delivered shipment, raised by either party. While OPEN or
+// RESPONDED the shipment is DISPUTED (frozen: no acknowledgement, no payment
+// submission). Admin resolves it; the shipment then returns to its prior status.
+model TransportDispute {
+  id               String                   @id @default(uuid())
+  disputeSeq       Int                      @unique @default(autoincrement())
+  disputeNumber    String                   @unique
+  requestId        String
+  raisedById       String
+  raisedByRole     String                   // 'REQUESTER' | 'PROVIDER'
+  category         TransportDisputeCategory
+  description      String
+  claimAmount      Decimal?                 @db.Decimal(14, 2)
+  status           TransportDisputeStatus   @default(OPEN)
+  response         String?
+  respondedAt      DateTime?
+  respondedById    String?
+  resolutionOutcome String?                 // 'FAVOUR_REQUESTER' | 'FAVOUR_PROVIDER' | 'SETTLED'
+  resolutionNote   String?
+  resolvedAt       DateTime?
+  resolvedById     String?
+  withdrawnAt      DateTime?
+  clientRequestId  String?
+  createdAt        DateTime                 @default(now())
+  updatedAt        DateTime                 @updatedAt
+
+  request  TransportRequest @relation(fields: [requestId], references: [id])
+  raisedBy User             @relation("TransportDisputeRaiser", fields: [raisedById], references: [id])
+
+  @@unique([requestId, clientRequestId])
+  @@index([requestId, status])
+  @@index([status])
+  // SQL migration also adds: UNIQUE (requestId) WHERE status IN ('OPEN','RESPONDED')
+  @@map("transport_disputes")
 }
 
 // ─── MESSAGING ────────────────────────────────────────────────────────────────

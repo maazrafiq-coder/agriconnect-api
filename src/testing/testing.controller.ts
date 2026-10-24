@@ -2,13 +2,15 @@ import { Throttle } from '@nestjs/throttler';
 import { Controller, Get, Post, Patch, Param, Body, Query, UseGuards, UseInterceptors, UploadedFile } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { TestingService, CreateTestingRequestDto, SubmitReportDto, AgencyQueryDto, RegisterAgencyDto, UpdateAgencyDto } from './testing.service';
-import { TransportService, QuoteTransportDto, TrackingUpdateDto, CreateTransportRequestDto, BookTransportDto, TransportQueryDto, RegisterProviderDto, UpdateProviderDto } from './testing.service';
+import { TransportService, CreateTransportRequestDto, BookTransportDto, TransportQueryDto, RegisterProviderDto, UpdateProviderDto } from './testing.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RequireApproved } from '../common/guards/approved-user.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { TestingStatus } from '@prisma/client';
+import { Headers } from '@nestjs/common';
+import { IDEM } from '../transport/transport.shared';
 
 // ─── TESTING CONTROLLER ───────────────────────────────────────────────────────
 @Controller('testing')
@@ -44,7 +46,8 @@ export class TestingController {
 
   @Post('requests')
   @RequireApproved()
-  createRequest(@CurrentUser('id') userId: string, @Body() dto: CreateTestingRequestDto) {
+  createRequest(@CurrentUser('id') userId: string, @Body() dto: CreateTestingRequestDto, @Headers('idempotency-key') key?: string) {
+    if (key && IDEM.test(key)) dto.clientRequestId = key;
     return this.testingService.createRequest(userId, dto);
   }
 
@@ -159,7 +162,8 @@ export class TransportController {
 
   @Post('requests')
   @RequireApproved()
-  createRequest(@CurrentUser('id') userId: string, @Body() dto: CreateTransportRequestDto) {
+  createRequest(@CurrentUser('id') userId: string, @Body() dto: CreateTransportRequestDto, @Headers('idempotency-key') key?: string) {
+    if (key && IDEM.test(key)) dto.clientRequestId = key;
     return this.transportService.createRequest(userId, dto);
   }
 
@@ -167,60 +171,6 @@ export class TransportController {
   @RequireApproved()
   book(@CurrentUser('id') userId: string, @Body() dto: BookTransportDto) {
     return this.transportService.bookTransport(userId, dto);
-  }
-
-  @Get('requests/my')
-  @UseGuards(JwtAuthGuard)
-  getMyRequests(
-    @CurrentUser('id') userId: string,
-    @Query('role') role: 'requester' | 'provider' = 'requester',
-  ) {
-    return this.transportService.getMyRequests(userId, role);
-  }
-
-  // Provider sends a price for the request
-  @Patch('requests/:id/quote')
-  @RequireApproved()
-  quote(@Param('id') id: string, @CurrentUser('id') userId: string, @Body() dto: QuoteTransportDto) {
-    return this.transportService.quote(id, userId, dto);
-  }
-
-  // Requester accepts the quote -> BOOKED at the quoted price
-  @Patch('requests/:id/accept')
-  @RequireApproved()
-  acceptQuote(@Param('id') id: string, @CurrentUser('id') userId: string) {
-    return this.transportService.acceptQuote(id, userId);
-  }
-
-  // Provider declines (request returns to the requester unassigned)
-  @Patch('requests/:id/decline')
-  @RequireApproved()
-  decline(@Param('id') id: string, @CurrentUser('id') userId: string, @Body('reason') reason: string) {
-    return this.transportService.declineRequest(id, userId, reason);
-  }
-
-  @Patch('requests/:id/cancel')
-  @RequireApproved()
-  cancel(@Param('id') id: string, @CurrentUser('id') userId: string) {
-    return this.transportService.cancelRequest(id, userId);
-  }
-
-  @Patch('requests/:id/tracking')
-  @RequireApproved()
-  updateTracking(
-    @Param('id') id: string,
-    @CurrentUser('id') userId: string,
-    @Body() data: TrackingUpdateDto,
-  ) {
-    return this.transportService.updateTracking(id, userId, data);
-  }
-
-  // Public by design (shared link). Tighter than the global limit so the id
-  // space can't be probed: 20 lookups/min/IP.
-  @Get('track/:id')
-  @Throttle({ default: { limit: 20, ttl: 60000 } })
-  track(@Param('id') id: string) {
-    return this.transportService.track(id);
   }
 
   // GET /transport/admin/all — includes delisted providers too

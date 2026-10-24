@@ -4,6 +4,7 @@ import { NotificationType, OfferStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { NotificationsService } from '../notifications/notifications.service';
 
+import { destination } from '../notifications/destinations';
 export class PostOfferMessageDto {
   @IsString() @MinLength(1) @MaxLength(2000) body: string;
 }
@@ -59,7 +60,7 @@ export class OfferMessagesService {
       type: NotificationType.OFFER_RECEIVED,
       title: `New message about ${offer.product.name}`,
       body: body.length > 120 ? body.slice(0, 117) + '…' : body,
-      data: { link: isBuyer ? '/seller' : '/buyer', offerId },
+      data: destination(isBuyer ? '/seller' : '/buyer', { tab: 'messages', entityType: 'offer', entityId: offerId }),
     });
     return created;
   }

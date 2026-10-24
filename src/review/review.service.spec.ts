@@ -5,6 +5,7 @@ import { BadRequestException, ForbiddenException, NotFoundException, Unauthorize
 import { ReviewService } from './review.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { ClarificationStatus } from '@prisma/client';
+import { NotificationsService } from '../notifications/notifications.service';
 
 /**
  * Round 2, Milestone 3 — KYC clarification workflow.
@@ -18,6 +19,7 @@ describe('ReviewService — clarification workflow', () => {
   let service: ReviewService;
   let prisma: any;
   let jwt: JwtService;
+  let notifications: { notify: jest.Mock };
 
   const baseClarification = {
     id: 'clar-1',
@@ -30,11 +32,21 @@ describe('ReviewService — clarification workflow', () => {
   };
 
   beforeEach(async () => {
+    notifications = { notify: jest.fn().mockResolvedValue(undefined) };
     prisma = {
       user: {
         findUnique: jest.fn().mockResolvedValue({ id: 'user-1' }),
         update: jest.fn().mockResolvedValue({}),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        findMany: jest.fn().mockResolvedValue([]),
       },
+      // Phase 1: thread messages. count>0 = already migrated thread.
+      reviewClarificationMessage: {
+        count: jest.fn().mockResolvedValue(1),
+        create: jest.fn().mockImplementation(({ data }) => Promise.resolve({ id: 'msg-new', ...data })),
+        findUnique: jest.fn().mockResolvedValue(null),
+      },
+      $transaction: jest.fn().mockImplementation((fn: any) => fn(prisma)),
       reviewClarification: {
         create: jest.fn().mockResolvedValue(baseClarification),
         findUnique: jest.fn()
@@ -46,6 +58,7 @@ describe('ReviewService — clarification workflow', () => {
       },
       clarificationAttachment: {
         createMany: jest.fn().mockResolvedValue({ count: 1 }),
+        updateMany: jest.fn().mockResolvedValue({ count: 0 }),
         findUnique: jest.fn().mockResolvedValue({
           id: 'att-1',
           fileName: 'cnic-front.jpg',
@@ -71,6 +84,7 @@ describe('ReviewService — clarification workflow', () => {
       providers: [
         ReviewService,
         { provide: PrismaService, useValue: prisma },
+        { provide: NotificationsService, useValue: notifications },
         { provide: ConfigService, useValue: { get: (key: string) => (key === 'JWT_SECRET' ? 'test-secret' : undefined) } },
       ],
     }).compile();
@@ -113,11 +127,75 @@ describe('ReviewService — clarification workflow', () => {
       expect(result.status).toBe(ClarificationStatus.RESPONDED);
     });
 
-    it('puts the user back to SUBMITTED so it re-enters the review queue', async () => {
+    it('puts an INFO_REQUESTED user back to SUBMITTED so it re-enters the review queue', async () => {
       await service.respondToClarification('user-1', 'BUYER', 'clar-1', dto, []);
-      expect(prisma.user.update).toHaveBeenCalledWith(
-        expect.objectContaining({ where: { id: 'user-1' }, data: { kycStatus: 'SUBMITTED' } }),
-      );
+      expect(prisma.user.updateMany).toHaveBeenCalledWith({
+        where: { id: 'user-1', kycStatus: 'INFO_REQUESTED' },
+        data: { kycStatus: 'SUBMITTED' },
+      });
+    });
+
+    it('never touches the KYC status of an account that is not INFO_REQUESTED (filter is part of the query)', async () => {
+      prisma.user.updateMany.mockResolvedValue({ count: 0 }); // e.g. an APPROVED account
+      await expect(service.respondToClarification('user-1', 'BUYER', 'clar-1', dto, [])).resolves.toBeDefined();
+      const arg = prisma.user.updateMany.mock.calls[0][0];
+      expect(arg.where.kycStatus).toBe('INFO_REQUESTED');
+      expect(prisma.user.update).not.toHaveBeenCalled();
+    });
+
+    it('stores the reply as its own message (does not overwrite the previous one) with the sender recorded', async () => {
+      await service.respondToClarification('user-1', 'BUYER', 'clar-1', dto, []);
+      expect(prisma.reviewClarificationMessage.create).toHaveBeenCalledWith({
+        data: { clarificationId: 'clar-1', senderId: 'user-1', senderRole: 'SUBJECT', body: dto.responseMessage, clientRequestId: null },
+      });
+    });
+
+    it('notifies the reviewer who asked, with a structured destination', async () => {
+      await service.respondToClarification('user-1', 'BUYER', 'clar-1', dto, []);
+      expect(notifications.notify).toHaveBeenCalledWith(expect.objectContaining({
+        userId: 'admin-1',
+        data: expect.objectContaining({ route: '/admin', tab: 'users', entityType: 'kyc', entityId: 'user-1' }),
+      }));
+    });
+
+    describe('idempotency (double-click / retry)', () => {
+      it('returns the stored thread and writes NOTHING when the clientRequestId was already used', async () => {
+        prisma.reviewClarificationMessage.findUnique.mockResolvedValue({ id: 'msg-1', clarificationId: 'clar-1', clientRequestId: 'req-1' });
+        prisma.reviewClarification.findUnique.mockReset().mockResolvedValue({ ...baseClarification, status: ClarificationStatus.RESPONDED });
+        const res: any = await service.respondToClarification('user-1', 'BUYER', 'clar-1', { ...dto, clientRequestId: 'req-1' }, []);
+        expect(res.replayed).toBe(true);
+        expect(prisma.reviewClarificationMessage.create).not.toHaveBeenCalled();
+        expect(prisma.$transaction).not.toHaveBeenCalled();
+        expect(prisma.user.updateMany).not.toHaveBeenCalled();
+        expect(notifications.notify).not.toHaveBeenCalled();
+      });
+
+      it('a replay after the thread was resolved is still a success, not "already resolved"', async () => {
+        prisma.reviewClarificationMessage.findUnique.mockResolvedValue({ id: 'msg-1' });
+        prisma.reviewClarification.findUnique.mockReset().mockResolvedValue({ ...baseClarification, status: ClarificationStatus.RESOLVED });
+        await expect(service.respondToClarification('user-1', 'BUYER', 'clar-1', { ...dto, clientRequestId: 'req-1' }, [])).resolves.toMatchObject({ replayed: true });
+      });
+
+      it('two racing identical submits: the unique-index loser (P2002) resolves as a replay', async () => {
+        prisma.$transaction.mockRejectedValue(Object.assign(new Error('unique'), { code: 'P2002' }));
+        prisma.reviewClarification.findUnique.mockReset().mockResolvedValue({ ...baseClarification, status: ClarificationStatus.RESPONDED });
+        const res: any = await service.respondToClarification('user-1', 'BUYER', 'clar-1', { ...dto, clientRequestId: 'req-2' }, []);
+        expect(res.replayed).toBe(true);
+      });
+
+      it('a P2002 without a clientRequestId is a real error and is not swallowed', async () => {
+        prisma.$transaction.mockRejectedValue(Object.assign(new Error('unique'), { code: 'P2002' }));
+        await expect(service.respondToClarification('user-1', 'BUYER', 'clar-1', dto, [])).rejects.toThrow('unique');
+      });
+    });
+
+    it('persists a legacy (pre-thread) request/response before adding the new message', async () => {
+      prisma.reviewClarificationMessage.count.mockResolvedValue(0);
+      prisma.reviewClarification.findUnique.mockReset().mockResolvedValue({ ...baseClarification, responseMessage: 'old reply', respondedAt: new Date('2026-03-02T00:00:00Z') });
+      await service.respondToClarification('user-1', 'BUYER', 'clar-1', dto, []);
+      const bodies = prisma.reviewClarificationMessage.create.mock.calls.map((c: any) => c[0].data.body);
+      expect(bodies).toEqual([baseClarification.requestMessage, 'old reply', dto.responseMessage]);
+      expect(prisma.clarificationAttachment.updateMany).toHaveBeenCalled();
     });
 
     it('stores attachments when files are provided', async () => {
@@ -131,9 +209,15 @@ describe('ReviewService — clarification workflow', () => {
       );
     });
 
-    it('lets an admin respond too (e.g. adding a follow-up note)', async () => {
-      const result = await service.respondToClarification('admin-1', 'ADMIN', 'clar-1', dto, []);
-      expect(result.status).toBe(ClarificationStatus.RESPONDED);
+    it('lets an admin add a follow-up: hands the thread back to the user (OPEN) and re-opens a waiting KYC', async () => {
+      await service.respondToClarification('admin-1', 'ADMIN', 'clar-1', dto, []);
+      expect(prisma.reviewClarification.update).toHaveBeenCalledWith({ where: { id: 'clar-1' }, data: { status: ClarificationStatus.OPEN } });
+      expect(prisma.user.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+        where: { id: 'user-1', kycStatus: { in: ['SUBMITTED', 'RECOMMENDED'] } },
+      }));
+      expect(notifications.notify).toHaveBeenCalledWith(expect.objectContaining({
+        userId: 'user-1', data: expect.objectContaining({ route: '/account', tab: 'profile' }),
+      }));
     });
 
     it('refuses an unrelated user', async () => {
@@ -165,6 +249,32 @@ describe('ReviewService — clarification workflow', () => {
     it('returns the thread for the owner', async () => {
       const result = await service.listForSubject('USER_KYC', 'user-1', 'user-1', 'BUYER');
       expect(result).toHaveLength(1);
+    });
+
+    it('returns a chronological message thread with sender names, identical for owner and admin', async () => {
+      prisma.reviewClarification.findMany.mockResolvedValue([{
+        ...baseClarification,
+        messages: [
+          { id: 'm2', senderId: 'user-1', senderRole: 'SUBJECT', body: 'reply', createdAt: new Date('2026-03-01T01:00:00Z'), attachments: [] },
+          { id: 'm1', senderId: 'admin-1', senderRole: 'REVIEWER', body: 'request', createdAt: new Date('2026-03-01T00:00:00Z'), attachments: [] },
+        ],
+      }]);
+      prisma.user.findMany.mockResolvedValue([
+        { id: 'user-1', role: 'FARMER', profile: { fullName: 'Ali Khan' } },
+        { id: 'admin-1', role: 'ADMIN', profile: null },
+      ]);
+      const asOwner: any = await service.listForSubject('USER_KYC', 'user-1', 'user-1', 'FARMER');
+      const asAdmin: any = await service.listForSubject('USER_KYC', 'user-1', 'admin-1', 'ADMIN');
+      expect(asOwner[0].messages.map((m: any) => m.id)).toEqual(['m1', 'm2']);
+      expect(asOwner[0].messages[1].senderName).toBe('Ali Khan');
+      expect(asOwner[0].messages[0].senderName).toBe('AgriConnect review team');
+      expect(asAdmin[0].messages).toEqual(asOwner[0].messages);
+    });
+
+    it('presents a legacy row (no message rows) as a two-message thread', async () => {
+      prisma.reviewClarification.findMany.mockResolvedValue([{ ...baseClarification, responseMessage: 'old reply', respondedAt: new Date('2026-03-02T00:00:00Z'), messages: [], attachments: [] }]);
+      const r: any = await service.listForSubject('USER_KYC', 'user-1', 'user-1', 'FARMER');
+      expect(r[0].messages.map((m: any) => m.senderRole)).toEqual(['REVIEWER', 'SUBJECT']);
     });
 
     it('returns the thread for an admin', async () => {

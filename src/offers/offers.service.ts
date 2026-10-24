@@ -1,15 +1,23 @@
 // ─── OFFERS SERVICE ───────────────────────────────────────────────────────────
+// Phase 2: an offer is a negotiation made of OfferRounds. Exactly one round is
+// CURRENT; the party who did NOT propose it may accept it, decline it, or
+// answer with a new round (which supersedes it). Accepting happens inside one
+// transaction that holds a row lock on the offer, so a double-click, two tabs
+// or a counter racing an accept can produce at most ONE order.
 import {
-  Injectable, NotFoundException, ForbiddenException, BadRequestException,
+  Injectable, NotFoundException, ForbiddenException, BadRequestException, ConflictException,
 } from '@nestjs/common';
+import { randomUUID } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { SettingsService } from '../settings/settings.service';
-import { NotificationType, OfferStatus, OrderStatus, PaymentStatus, ProductStatus, TransactionType } from '@prisma/client';
+import { NotificationType, OfferStatus, OfferRoundStatus, OrderStatus, ProductStatus, TransactionType } from '@prisma/client';
 import { recordAudit } from '../common/utils/audit.util';
 import { NotificationsService } from '../notifications/notifications.service';
+import { destination } from '../notifications/destinations';
 import {
-  IsString, IsNumber, IsOptional, IsDateString, IsPositive,
+  IsString, IsNumber, IsOptional, IsPositive, IsBoolean, IsObject, MaxLength, Matches,
 } from 'class-validator';
+import { normalizePaymentTerms, describeTerms, computeSchedule, contextFromOrder, PaymentTerms } from './terms/payment-terms';
 
 // ─── DTOs ─────────────────────────────────────────────────────────────────────
 export class CreateOfferDto {
@@ -22,31 +30,86 @@ export class CreateOfferDto {
   @IsNumber() @IsPositive()
   quantity: number;
 
-  @IsOptional() @IsString()
+  @IsOptional() @IsString() @MaxLength(1000)
   message?: string;
+
+  // Terms the buyer proposes. Omitted = the listing's own terms.
+  @IsOptional() @IsObject()
+  paymentTerms?: any;
+
+  // The buyer must explicitly agree to the terms being proposed.
+  @IsOptional() @IsBoolean()
+  acceptTerms?: boolean;
+
+  @IsOptional() @IsString() @MaxLength(100) @Matches(/^[A-Za-z0-9_-]+$/)
+  clientRequestId?: string;
 }
 
+// Legacy seller counter (price only) - still accepted; terms/qty carry forward.
 export class CounterOfferDto {
   @IsNumber() @IsPositive()
   counterPrice: number;
 
-  @IsOptional() @IsString()
+  @IsOptional() @IsString() @MaxLength(1000)
   counterMessage?: string;
+
+  @IsOptional() @IsNumber() @IsPositive()
+  quantity?: number;
+
+  @IsOptional() @IsObject()
+  paymentTerms?: any;
+
+  @IsOptional() @IsString() @MaxLength(100) @Matches(/^[A-Za-z0-9_-]+$/)
+  clientRequestId?: string;
 }
+
+// A new round from either party (buyer counter-back or seller counter).
+export class ProposeRoundDto {
+  @IsNumber() @IsPositive()
+  price: number;
+
+  @IsOptional() @IsNumber() @IsPositive()
+  quantity?: number;
+
+  @IsOptional() @IsObject()
+  paymentTerms?: any;
+
+  @IsOptional() @IsString() @MaxLength(1000)
+  message?: string;
+
+  // The round the caller was looking at; a mismatch means it changed under them.
+  @IsOptional() @IsString()
+  roundId?: string;
+
+  @IsOptional() @IsString() @MaxLength(100) @Matches(/^[A-Za-z0-9_-]+$/)
+  clientRequestId?: string;
+}
+
+export class AcceptRoundDto {
+  @IsOptional() @IsBoolean()
+  acceptTerms?: boolean;
+
+  @IsOptional() @IsString()
+  roundId?: string;
+}
+
+export const LEGACY_TERMS: PaymentTerms = {
+  type: 'OTHER',
+  description: 'Not specified - this offer was made before payment terms were introduced',
+};
+
+type Role = 'BUYER' | 'SELLER';
 
 @Injectable()
 export class OffersService {
   constructor(private prisma: PrismaService, private settings: SettingsService, private notifications: NotificationsService) {}
 
-  // Accounts that aren't fully APPROVED yet (e.g. INFO_REQUESTED — see
-  // auth.service.login()'s comment on why those users can now log in at
-  // all) can browse and respond to admin requests, but must not be able
-  // to transact. Checked against a fresh read rather than the JWT's
-  // (possibly stale) kycStatus claim, since a previously-approved account
-  // can be moved back to INFO_REQUESTED after the token was issued.
+  // Accounts that aren't fully APPROVED yet can browse and answer admin
+  // requests but must not transact. Checked against a fresh read rather than
+  // the JWT claim, which may be stale.
   private async assertCanTransact(
     userId: string,
-    action: 'make an offer on' | 'accept offers on' | 'accept counter-offers on',
+    action: 'make an offer on' | 'accept offers on' | 'accept counter-offers on' | 'negotiate offers on',
   ) {
     const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { kycStatus: true } });
     if (!user || user.kycStatus !== 'APPROVED') {
@@ -54,35 +117,57 @@ export class OffersService {
     }
   }
 
-  private static readonly OFFER_TTL_MS = 72 * 60 * 60 * 1000;
-  private static readonly OPEN_OFFER_STATES: OfferStatus[] = [
-  OfferStatus.PENDING,
-  OfferStatus.COUNTERED,
-];
+  static readonly OFFER_TTL_MS = 72 * 60 * 60 * 1000;
+  private static readonly OPEN_OFFER_STATES: OfferStatus[] = [OfferStatus.PENDING, OfferStatus.COUNTERED];
 
-  // Offer expiry is enforced lazily: whenever an offer is acted on we first
-  // check its deadline, and list queries sweep stale rows. (No cron needed.)
+  private static readonly round2 = (n: number) => Math.round(n * 100) / 100;
+
+  // Expiry is enforced lazily: when an offer is acted on we check its
+  // deadline, and list queries sweep stale rows. (No cron needed.)
+  private async expireOffer(offerId: string) {
+    await this.prisma.offerRound.updateMany({
+      where: { offerId, status: OfferRoundStatus.CURRENT },
+      data: { status: OfferRoundStatus.EXPIRED, respondedAt: new Date() },
+    });
+    await this.prisma.offer.updateMany({
+      where: { id: offerId, status: { in: OffersService.OPEN_OFFER_STATES } },
+      data: { status: OfferStatus.EXPIRED },
+    });
+  }
+
   private async failIfExpired(offer: { id: string; status: OfferStatus; expiresAt?: Date | null }) {
-    if (
-      offer.expiresAt &&
-      offer.expiresAt.getTime() < Date.now() &&
-      OffersService.OPEN_OFFER_STATES.includes(offer.status)
-    ) {
-      await this.prisma.offer.updateMany({
-        where: { id: offer.id, status: { in: OffersService.OPEN_OFFER_STATES } },
-        data: { status: OfferStatus.EXPIRED },
-      });
+    if (offer.expiresAt && offer.expiresAt.getTime() < Date.now() && OffersService.OPEN_OFFER_STATES.includes(offer.status)) {
+      await this.expireOffer(offer.id);
       throw new BadRequestException('This offer has expired');
     }
   }
 
   private async sweepExpired(where: Record<string, any>) {
+    const now = new Date();
+    await this.prisma.offerRound.updateMany({
+      where: { status: OfferRoundStatus.CURRENT, expiresAt: { lt: now }, offer: where },
+      data: { status: OfferRoundStatus.EXPIRED, respondedAt: now },
+    });
     await this.prisma.offer.updateMany({
-      where: { ...where, status: { in: OffersService.OPEN_OFFER_STATES }, expiresAt: { lt: new Date() } },
+      where: { ...where, status: { in: OffersService.OPEN_OFFER_STATES }, expiresAt: { lt: now } },
       data: { status: OfferStatus.EXPIRED },
     });
   }
 
+  // Row lock on the offer for the rest of the transaction (serialises
+  // concurrent accept / counter / decline on the same offer).
+  private async lockOffer(tx: any, offerId: string) {
+    await tx.$queryRaw`SELECT "id" FROM "offers" WHERE "id" = ${offerId} FOR UPDATE`;
+  }
+
+  private checkQuantity(product: { minOrderQty: number; quantity: number; unit: string }, qty: number) {
+    if (qty < product.minOrderQty) throw new BadRequestException(`Minimum order is ${product.minOrderQty} ${product.unit}`);
+    if (qty > product.quantity) throw new BadRequestException(`Only ${product.quantity} ${product.unit} available`);
+  }
+
+  private fmtMoney = (n: number) => `₨${Number(n).toLocaleString()}`;
+
+  // ─── CREATE (buyer's opening round) ───────────────────────────────────────
   async create(buyerId: string, dto: CreateOfferDto) {
     await this.assertCanTransact(buyerId, 'make an offer on');
 
@@ -90,149 +175,262 @@ export class OffersService {
     if (!product) throw new NotFoundException('Product not found');
     if (product.status !== ProductStatus.ACTIVE) throw new BadRequestException('This listing is not available for offers');
     if (product.sellerId === buyerId) throw new BadRequestException('Cannot make offer on your own product');
-    if (dto.quantity < product.minOrderQty) throw new BadRequestException(`Minimum order is ${product.minOrderQty} ${product.unit}`);
-    if (dto.quantity > product.quantity) throw new BadRequestException(`Only ${product.quantity} ${product.unit} available`);
+    this.checkQuantity(product, dto.quantity);
 
-    const created = await this.prisma.offer.create({
-      data: {
-        productId: dto.productId,
-        buyerId,
-        offeredPrice: dto.offeredPrice,
-        quantity: dto.quantity,
-        message: dto.message,
-        expiresAt: new Date(Date.now() + OffersService.OFFER_TTL_MS), // 72h expiry
-      },
-      include: {
-        product: { select: { name: true, unit: true, sellerId: true } },
-        buyer: { select: { profile: { select: { fullName: true } } } },
-      },
+    const rawTerms = dto.paymentTerms ?? (product as any).paymentTerms;
+    if (!rawTerms) throw new BadRequestException('Choose payment terms for your offer (the seller did not set default terms on this listing).');
+    const terms = normalizePaymentTerms(rawTerms);
+    if (dto.acceptTerms !== true) throw new BadRequestException('You must accept the payment terms to send this offer.');
+
+    // Idempotent replay: same buyer + same Idempotency-Key returns the offer already created.
+    if (dto.clientRequestId) {
+      const prior = await this.prisma.offerRound.findFirst({
+        where: { clientRequestId: dto.clientRequestId, proposerId: buyerId, roundNo: 1 },
+        select: { offerId: true },
+      });
+      if (prior) return this.loadOffer(prior.offerId);
+    }
+
+    const offerId = randomUUID();
+    const roundId = randomUUID();
+    const expiresAt = new Date(Date.now() + OffersService.OFFER_TTL_MS);
+    await this.prisma.$transaction(async (tx) => {
+      await tx.offer.create({
+        data: {
+          id: offerId, productId: dto.productId, buyerId, offeredPrice: dto.offeredPrice,
+          quantity: dto.quantity, message: dto.message, expiresAt, currentRoundId: roundId,
+        },
+      });
+      await tx.offerRound.create({
+        data: {
+          id: roundId, offerId, roundNo: 1, proposerId: buyerId, proposerRole: 'BUYER',
+          price: dto.offeredPrice, quantity: dto.quantity, paymentTerms: terms as any,
+          message: dto.message, status: OfferRoundStatus.CURRENT, expiresAt,
+          clientRequestId: dto.clientRequestId || null,
+          termsAcceptedAt: new Date(),
+        },
+      });
     });
+    const created = await this.loadOffer(offerId);
+    const buyerName = await this.prisma.user.findUnique({ where: { id: buyerId }, select: { profile: { select: { fullName: true } } } });
     await this.notifications.notify({
       userId: product.sellerId,
       type: NotificationType.OFFER_RECEIVED,
       title: 'New offer on your listing',
-      body: `${created.buyer?.profile?.fullName || 'A buyer'} offered ₨${Number(dto.offeredPrice).toLocaleString()} × ${dto.quantity} ${product.unit} for ${product.name}.`,
-      data: { link: '/seller', offerId: created.id },
+      body: `${buyerName?.profile?.fullName || 'A buyer'} offered ${this.fmtMoney(dto.offeredPrice)} × ${dto.quantity} ${product.unit} for ${product.name}. Terms: ${describeTerms(terms)}.`,
+      data: destination('/seller', { tab: 'offers', entityType: 'offer', entityId: offerId }),
     });
+    await recordAudit(this.prisma, buyerId, 'offer_round_proposed', 'offer', offerId, { roundNo: 1, price: dto.offeredPrice, quantity: dto.quantity, terms });
     return created;
   }
 
-  // Seller accepts the buyer's ORIGINAL offer. A countered offer can only be
-  // closed by the buyer (see acceptCounter) — previously the seller could
-  // "accept" a countered offer and the order silently used the buyer's
-  // original price instead of the counter.
-  async accept(offerId: string, sellerId: string) {
-    await this.assertCanTransact(sellerId, 'accept offers on');
-
-    const offer = await this.prisma.offer.findUnique({
+  private loadOffer(offerId: string) {
+    return this.prisma.offer.findUnique({
       where: { id: offerId },
-      include: { product: true },
+      include: {
+        product: { select: { name: true, unit: true, sellerId: true } },
+        buyer: { select: { profile: { select: { fullName: true } } } },
+        rounds: { orderBy: { roundNo: 'asc' } },
+      },
     });
-    if (!offer) throw new NotFoundException('Offer not found');
-    if (offer.product.sellerId !== sellerId) throw new ForbiddenException('Not your listing');
-    if (offer.status === OfferStatus.COUNTERED) {
-      throw new BadRequestException('You countered this offer — waiting for the buyer to accept or decline your counter.');
-    }
-    if (offer.status !== OfferStatus.PENDING) {
-      throw new BadRequestException(`Cannot accept offer in ${offer.status} status`);
-    }
-    await this.failIfExpired(offer);
-
-    return this.createOrderFromOffer(offer, Number(offer.offeredPrice), sellerId, 'Offer accepted');
   }
 
-  // Buyer accepts the seller's counter-offer. The order is created at the
-  // COUNTER price.
-  async acceptCounter(offerId: string, buyerId: string) {
-    await this.assertCanTransact(buyerId, 'accept counter-offers on');
+  // ─── PROPOSE A NEW ROUND (counter / counter-back) ─────────────────────────
+  async propose(offerId: string, actorId: string, dto: ProposeRoundDto, opts: { requirePending?: boolean } = {}) {
+    await this.assertCanTransact(actorId, 'negotiate offers on');
 
-    const offer = await this.prisma.offer.findUnique({
-      where: { id: offerId },
-      include: { product: true },
-    });
-    if (!offer) throw new NotFoundException('Offer not found');
-    if (offer.buyerId !== buyerId) throw new ForbiddenException('Not your offer');
-    if (offer.status !== OfferStatus.COUNTERED || offer.counterPrice == null) {
-      throw new BadRequestException('There is no counter-offer to accept on this offer');
-    }
-    await this.failIfExpired(offer);
-
-    return this.createOrderFromOffer(offer, Number(offer.counterPrice), buyerId, 'Counter-offer accepted by buyer');
-  }
-
-  // Everything an acceptance changes happens in ONE transaction, so a
-  // failure part-way can no longer leave an ACCEPTED offer with no order or
-  // an order without its stock deducted:
-  //   1. offer -> ACCEPTED (guarded on the status we read, so a double-tap
-  //      or two-tab race can only succeed once)
-  //   2. product stock -= quantity (guarded: must be live and have enough)
-  //      and the listing flips to SOLD when it hits zero
-  //   3. competing open offers that can no longer be fulfilled are closed
-  //   4. order + status history + ledger rows are created
-  private async createOrderFromOffer(
-    offer: { id: string; productId: string; buyerId: string; quantity: number; status: OfferStatus; product: { sellerId: string } },
-    unitPrice: number,
-    actorId: string,
-    note: string,
-  ) {
-    const sellerId = offer.product.sellerId;
-    const round2 = (n: number) => Math.round(n * 100) / 100;
-    const totalAmount = round2(unitPrice * offer.quantity);
-    // Admin-configurable (Settings → platform fee); the % in force at
-    // acceptance is frozen onto the order.
-    const platformFeePct = await this.settings.getPlatformFeePct();
-    const platformFee = round2((totalAmount * platformFeePct) / 100);
+    const pre = await this.prisma.offer.findUnique({ where: { id: offerId }, include: { product: true } });
+    if (!pre) throw new NotFoundException('Offer not found');
+    const role: Role | null = pre.buyerId === actorId ? 'BUYER' : pre.product.sellerId === actorId ? 'SELLER' : null;
+    if (!role) throw new ForbiddenException('Not your offer');
+    if (opts.requirePending && pre.status !== OfferStatus.PENDING) throw new BadRequestException('Can only counter pending offers');
+    await this.failIfExpired(pre);
 
     const result = await this.prisma.$transaction(async (tx) => {
+      await this.lockOffer(tx, offerId);
+      const offer = await tx.offer.findUnique({ where: { id: offerId }, include: { product: true } });
+      if (!offer || !OffersService.OPEN_OFFER_STATES.includes(offer.status)) {
+        throw new BadRequestException(`This negotiation is already closed (${offer?.status ?? 'unknown'}).`);
+      }
+      const current = await tx.offerRound.findFirst({ where: { offerId, status: OfferRoundStatus.CURRENT } });
+      if (!current) throw new BadRequestException('This negotiation has no open round.');
+      if (dto.roundId && dto.roundId !== current.id) {
+        throw new ConflictException('This offer changed while you were looking at it - a newer round exists. Refresh and review it.');
+      }
+      if (current.proposerRole === role) {
+        throw new BadRequestException('You already have a proposal on the table - wait for the other party to respond.');
+      }
+
+      const quantity = dto.quantity ?? current.quantity;
+      this.checkQuantity(offer.product, quantity);
+      const rawTerms = dto.paymentTerms ?? current.paymentTerms;
+      const terms = rawTerms ? normalizePaymentTerms(rawTerms) : normalizePaymentTerms((offer.product as any).paymentTerms ?? LEGACY_TERMS);
+
+      const newId = randomUUID();
+      const expiresAt = new Date(Date.now() + OffersService.OFFER_TTL_MS);
+      await tx.offerRound.update({
+        where: { id: current.id },
+        data: { status: OfferRoundStatus.SUPERSEDED, supersededById: newId, respondedAt: new Date(), respondedById: actorId },
+      });
+      const round = await tx.offerRound.create({
+        data: {
+          id: newId, offerId, roundNo: current.roundNo + 1, proposerId: actorId, proposerRole: role,
+          price: dto.price, quantity, paymentTerms: terms as any, message: dto.message,
+          status: OfferRoundStatus.CURRENT, expiresAt, clientRequestId: dto.clientRequestId || null,
+        },
+      });
+      await tx.offer.update({
+        where: { id: offerId },
+        data: {
+          status: role === 'SELLER' ? OfferStatus.COUNTERED : OfferStatus.PENDING,
+          ...(role === 'SELLER'
+            ? { counterPrice: dto.price, counterMessage: dto.message }
+            : { offeredPrice: dto.price, message: dto.message, counterPrice: null, counterMessage: null }),
+          quantity, expiresAt, currentRoundId: newId,
+        },
+      });
+      return { round, offer };
+    }).catch(async (err: any) => {
+      if (err?.code === 'P2002' && dto.clientRequestId) {
+        const replay = await this.prisma.offerRound.findFirst({ where: { offerId, clientRequestId: dto.clientRequestId } });
+        if (replay) return { round: replay, offer: pre, replay: true };
+      }
+      throw err;
+    });
+
+    if (!(result as any).replay) {
+      const other = role === 'SELLER' ? pre.buyerId : pre.product.sellerId;
+      await this.notifications.notify({
+        userId: other,
+        type: NotificationType.OFFER_RECEIVED,
+        title: role === 'SELLER' ? 'The seller sent a counter-offer' : 'The buyer sent a counter-offer',
+        body: `${this.fmtMoney(dto.price)} × ${result.round.quantity} ${pre.product.unit} on ${pre.product.name} (round ${result.round.roundNo}). Terms: ${describeTerms(result.round.paymentTerms as any)}. Respond within 72 hours.`,
+        data: destination(role === 'SELLER' ? '/buyer' : '/seller', { tab: 'offers', entityType: 'offer', entityId: offerId }),
+      });
+      await recordAudit(this.prisma, actorId, 'offer_round_proposed', 'offer', offerId, {
+        roundNo: result.round.roundNo, role, price: dto.price, quantity: result.round.quantity, terms: result.round.paymentTerms,
+      });
+    }
+    return this.loadOffer(offerId);
+  }
+
+  // Legacy seller counter (price + message). Quantity and terms carry forward unless given.
+  async counter(offerId: string, sellerId: string, dto: CounterOfferDto) {
+    const offer = await this.prisma.offer.findUnique({ where: { id: offerId }, include: { product: true } });
+    if (!offer) throw new NotFoundException('Offer not found');
+    if (offer.product.sellerId !== sellerId) throw new ForbiddenException('Not your listing');
+    return this.propose(offerId, sellerId, {
+      price: dto.counterPrice, message: dto.counterMessage, quantity: dto.quantity,
+      paymentTerms: dto.paymentTerms, clientRequestId: dto.clientRequestId,
+    }, { requirePending: true });
+  }
+
+  // ─── ACCEPT ───────────────────────────────────────────────────────────────
+  // Seller accepts the buyer's CURRENT round (legacy route /accept).
+  async accept(offerId: string, sellerId: string, dto: AcceptRoundDto = {}) {
+    await this.assertCanTransact(sellerId, 'accept offers on');
+    return this.acceptRound(offerId, sellerId, dto, 'SELLER');
+  }
+
+  // Buyer accepts the seller's CURRENT round (legacy route /accept-counter).
+  async acceptCounter(offerId: string, buyerId: string, dto: AcceptRoundDto = {}) {
+    await this.assertCanTransact(buyerId, 'accept counter-offers on');
+    return this.acceptRound(offerId, buyerId, dto, 'BUYER');
+  }
+
+  private async acceptRound(offerId: string, actorId: string, dto: AcceptRoundDto, expectRole: Role) {
+    const pre = await this.prisma.offer.findUnique({ where: { id: offerId }, include: { product: true } });
+    if (!pre) throw new NotFoundException('Offer not found');
+    const role: Role | null = pre.buyerId === actorId ? 'BUYER' : pre.product.sellerId === actorId ? 'SELLER' : null;
+    if (!role) throw new ForbiddenException(expectRole === 'SELLER' ? 'Not your listing' : 'Not your offer');
+    if (role !== expectRole) throw new ForbiddenException(expectRole === 'SELLER' ? 'Only the seller can accept here' : 'Only the buyer can accept here');
+    if (pre.status === OfferStatus.COUNTERED && role === 'SELLER') {
+      throw new BadRequestException('You countered this offer - waiting for the buyer to accept or decline your counter.');
+    }
+    if (pre.status === OfferStatus.PENDING && role === 'BUYER') {
+      throw new BadRequestException('There is no counter-offer to accept on this offer');
+    }
+    if (!OffersService.OPEN_OFFER_STATES.includes(pre.status)) {
+      throw new BadRequestException(`Cannot accept offer in ${pre.status} status`);
+    }
+    await this.failIfExpired(pre);
+    if (dto.acceptTerms !== true) throw new BadRequestException('You must review and accept the payment terms to accept this offer.');
+
+    const sellerId = pre.product.sellerId;
+    const platformFeePct = await this.settings.getPlatformFeePct();
+    const round2 = OffersService.round2;
+
+    const result = await this.prisma.$transaction(async (tx) => {
+      await this.lockOffer(tx, offerId);
+      const offer = await tx.offer.findUnique({ where: { id: offerId } });
+      if (!offer || !OffersService.OPEN_OFFER_STATES.includes(offer.status)) {
+        throw new BadRequestException('This offer was already processed');
+      }
+      const round = await tx.offerRound.findFirst({ where: { offerId, status: OfferRoundStatus.CURRENT } });
+      if (!round) throw new BadRequestException('This offer was already processed');
+      if (dto.roundId && dto.roundId !== round.id) {
+        throw new ConflictException('This offer changed while you were reviewing it - a newer round exists. Refresh and review it.');
+      }
+      if (round.proposerRole === role) {
+        throw new BadRequestException('You proposed the current terms - the other party has to accept them.');
+      }
+
+      const unitPrice = Number(round.price);
+      const quantity = round.quantity;
+      const totalAmount = round2(unitPrice * quantity);
+      const platformFee = round2((totalAmount * platformFeePct) / 100);
+      const snapshot = round.paymentTerms ? normalizePaymentTerms(round.paymentTerms) : LEGACY_TERMS;
+
       const guarded = await tx.offer.updateMany({
-        where: { id: offer.id, status: offer.status },
-        data: { status: OfferStatus.ACCEPTED },
+        where: { id: offerId, status: { in: OffersService.OPEN_OFFER_STATES } },
+        data: { status: OfferStatus.ACCEPTED, offeredPrice: role === 'SELLER' ? unitPrice : undefined, quantity },
       });
       if (guarded.count === 0) throw new BadRequestException('This offer was already processed');
 
-      const stock = await tx.product.updateMany({
-        where: {
-          id: offer.productId,
-          status: { in: [ProductStatus.ACTIVE, ProductStatus.UNDER_OFFER] },
-          quantity: { gte: offer.quantity },
-        },
-        data: { quantity: { decrement: offer.quantity } },
+      const acceptedRound = await tx.offerRound.updateMany({
+        where: { id: round.id, status: OfferRoundStatus.CURRENT },
+        data: { status: OfferRoundStatus.ACCEPTED, respondedAt: new Date(), respondedById: actorId, termsAcceptedAt: new Date() },
       });
-      if (stock.count === 0) {
-        throw new BadRequestException('This listing is no longer available in the offered quantity');
-      }
+      if (acceptedRound.count === 0) throw new BadRequestException('This offer was already processed');
+
+      const stock = await tx.product.updateMany({
+        where: { id: offer.productId, status: { in: [ProductStatus.ACTIVE, ProductStatus.UNDER_OFFER] }, quantity: { gte: quantity } },
+        data: { quantity: { decrement: quantity } },
+      });
+      if (stock.count === 0) throw new BadRequestException('This listing is no longer available in the offered quantity');
 
       const product = await tx.product.findUnique({ where: { id: offer.productId }, select: { quantity: true } });
       const remaining = product?.quantity ?? 0;
-      if (remaining <= 0) {
-        await tx.product.update({ where: { id: offer.productId }, data: { status: ProductStatus.SOLD } });
+      if (remaining <= 0) await tx.product.update({ where: { id: offer.productId }, data: { status: ProductStatus.SOLD } });
+
+      // Competing open offers that can no longer be filled are closed (offer AND its current round).
+      const competing = await tx.offer.findMany({
+        where: { productId: offer.productId, id: { not: offerId }, status: { in: OffersService.OPEN_OFFER_STATES }, quantity: { gt: Math.max(remaining, 0) } },
+        select: { id: true },
+      });
+      if (competing.length) {
+        const ids = competing.map((c: any) => c.id);
+        await tx.offer.updateMany({
+          where: { id: { in: ids }, status: { in: OffersService.OPEN_OFFER_STATES } },
+          data: { status: OfferStatus.REJECTED, rejectionReason: remaining <= 0 ? 'This listing has been sold.' : 'Not enough stock left after another order was confirmed.' },
+        });
+        await tx.offerRound.updateMany({
+          where: { offerId: { in: ids }, status: OfferRoundStatus.CURRENT },
+          data: { status: OfferRoundStatus.DECLINED, respondedAt: new Date() },
+        });
       }
 
-      await tx.offer.updateMany({
-        where: {
-          productId: offer.productId,
-          id: { not: offer.id },
-          status: { in: OffersService.OPEN_OFFER_STATES },
-          quantity: { gt: Math.max(remaining, 0) },
-        },
-        data: {
-          status: OfferStatus.REJECTED,
-          rejectionReason: remaining <= 0 ? 'This listing has been sold.' : 'Not enough stock left after another order was confirmed.',
-        },
-      });
-
+      const acceptedAt = new Date();
       const order = await tx.order.create({
         data: {
-          offerId: offer.id,
-          sellerId,
-          buyerId: offer.buyerId,
-          totalAmount,
-          platformFeePct,
-          platformFee,
+          offerId, sellerId, buyerId: offer.buyerId, totalAmount, platformFeePct, platformFee,
           netSellerAmount: round2(totalAmount - platformFee),
           status: OrderStatus.CONFIRMED,
+          unitPrice, quantity, acceptedRoundId: round.id,
+          paymentTermsSnapshot: Object.freeze({ ...snapshot }) as any,
+          termsAcceptedAt: acceptedAt, termsAcceptedById: actorId,
           statusHistory: {
-            create: { status: OrderStatus.CONFIRMED, changedBy: actorId, note },
+            create: { status: OrderStatus.CONFIRMED, changedBy: actorId, note: role === 'SELLER' ? 'Offer accepted' : 'Counter-offer accepted by buyer' },
           },
         },
         include: {
@@ -241,51 +439,65 @@ export class OffersService {
           buyer: { select: { profile: { select: { fullName: true } } } },
         },
       });
-
-      // No ledger rows here on purpose: nothing has been paid or earned yet.
-      // The sale is booked when the order is COMPLETED (see
-      // OrdersService.recordSettlement).
-
-      const updatedOffer = await tx.offer.findUnique({ where: { id: offer.id } });
-      return { offer: updatedOffer, order };
+      // No ledger rows here on purpose: the sale is booked when the order is COMPLETED.
+      const updatedOffer = await tx.offer.findUnique({ where: { id: offerId } });
+      return { offer: updatedOffer, order, unitPrice, totalAmount, roundNo: round.roundNo, snapshot };
     });
 
-    // Tell the party who did NOT click accept.
-    const otherParty = actorId === sellerId ? offer.buyerId : sellerId;
+    const otherParty = role === 'SELLER' ? pre.buyerId : sellerId;
     await this.notifications.notify({
       userId: otherParty,
       type: NotificationType.OFFER_ACCEPTED,
-      title: actorId === sellerId ? 'Your offer was accepted' : 'Your counter-offer was accepted',
-      body: `An order of ₨${totalAmount.toLocaleString()} was created at ₨${unitPrice.toLocaleString()} per unit.`,
-      data: { link: actorId === sellerId ? '/buyer' : '/seller', orderId: (result as any).order?.id },
+      title: role === 'SELLER' ? 'Your offer was accepted' : 'Your counter-offer was accepted',
+      body: `An order of ${this.fmtMoney(result.totalAmount)} was created at ${this.fmtMoney(result.unitPrice)} per unit. Terms: ${describeTerms(result.snapshot)}.`,
+      data: destination(role === 'SELLER' ? '/buyer' : '/seller', { tab: 'orders', entityType: 'order', entityId: (result as any).order?.id }),
     });
-    return result;
+    await recordAudit(this.prisma, actorId, 'offer_round_accepted', 'offer', offerId, {
+      roundNo: result.roundNo, orderId: (result as any).order?.id, unitPrice: result.unitPrice, terms: result.snapshot,
+    });
+    return { offer: result.offer, order: result.order };
+  }
+
+  // ─── DECLINE / WITHDRAW ───────────────────────────────────────────────────
+  private async closeOffer(offerId: string, actorId: string, offerStatus: OfferStatus, reason?: string) {
+    const roundBefore = await this.prisma.$transaction(async (tx) => {
+      await this.lockOffer(tx, offerId);
+      const res = await tx.offer.updateMany({
+        where: { id: offerId, status: { in: OffersService.OPEN_OFFER_STATES } },
+        data: { status: offerStatus, rejectionReason: reason || undefined },
+      });
+      if (res.count === 0) throw new BadRequestException('This offer was already processed');
+      const cur = await tx.offerRound.findFirst({ where: { offerId, status: OfferRoundStatus.CURRENT } });
+      if (cur) {
+        await tx.offerRound.update({
+          where: { id: cur.id },
+          data: {
+            status: cur.proposerId === actorId ? OfferRoundStatus.WITHDRAWN : OfferRoundStatus.DECLINED,
+            respondedAt: new Date(), respondedById: actorId,
+          },
+        });
+      }
+      return cur;
+    });
+    await recordAudit(this.prisma, actorId, offerStatus === OfferStatus.REJECTED ? 'offer_declined' : 'offer_withdrawn', 'offer', offerId, { reason, roundNo: roundBefore?.roundNo });
   }
 
   async reject(offerId: string, sellerId: string, reason?: string) {
-    const offer = await this.prisma.offer.findUnique({
-      where: { id: offerId },
-      include: { product: true },
-    });
+    const offer = await this.prisma.offer.findUnique({ where: { id: offerId }, include: { product: true } });
     if (!offer) throw new NotFoundException('Offer not found');
     if (offer.product.sellerId !== sellerId) throw new ForbiddenException('Not your listing');
     if (!OffersService.OPEN_OFFER_STATES.includes(offer.status)) {
       throw new BadRequestException(`Cannot reject an offer in ${offer.status} status`);
     }
-
-    const res = await this.prisma.offer.updateMany({
-      where: { id: offerId, status: { in: OffersService.OPEN_OFFER_STATES } },
-      data: { status: OfferStatus.REJECTED, rejectionReason: reason || undefined },
-    });
-    if (res.count === 0) throw new BadRequestException('This offer was already processed');
+    await this.closeOffer(offerId, sellerId, OfferStatus.REJECTED, reason);
     await this.notifications.notify({
       userId: offer.buyerId,
       type: NotificationType.OFFER_REJECTED,
       title: 'Your offer was declined',
       body: `The seller declined your offer on ${offer.product.name}${reason ? `: ${reason}` : '.'}`,
-      data: { link: '/buyer', offerId },
+      data: destination('/buyer', { tab: 'offers', entityType: 'offer', entityId: offerId }),
     });
-    return this.prisma.offer.findUnique({ where: { id: offerId } });
+    return this.loadOffer(offerId);
   }
 
   // Buyer withdraws an open offer, or declines the seller's counter.
@@ -296,64 +508,47 @@ export class OffersService {
     if (!OffersService.OPEN_OFFER_STATES.includes(offer.status)) {
       throw new BadRequestException(`Cannot withdraw an offer in ${offer.status} status`);
     }
-
-    const res = await this.prisma.offer.updateMany({
-      where: { id: offerId, status: { in: OffersService.OPEN_OFFER_STATES } },
-      data: { status: OfferStatus.WITHDRAWN },
-    });
-    if (res.count === 0) throw new BadRequestException('This offer was already processed');
+    await this.closeOffer(offerId, buyerId, OfferStatus.WITHDRAWN);
     if (offer.product?.sellerId) {
       await this.notifications.notify({
         userId: offer.product.sellerId,
         type: NotificationType.OFFER_REJECTED,
         title: offer.status === OfferStatus.COUNTERED ? 'Your counter-offer was declined' : 'An offer was withdrawn',
         body: `The buyer ${offer.status === OfferStatus.COUNTERED ? 'declined your counter on' : 'withdrew their offer on'} ${offer.product.name}.`,
-        data: { link: '/seller', offerId },
+        data: destination('/seller', { tab: 'offers', entityType: 'offer', entityId: offerId }),
       });
     }
-    return this.prisma.offer.findUnique({ where: { id: offerId } });
+    return this.loadOffer(offerId);
   }
 
-  async counter(offerId: string, sellerId: string, dto: CounterOfferDto) {
-    const offer = await this.prisma.offer.findUnique({
-      where: { id: offerId },
-      include: { product: true },
-    });
+  // ─── READS ────────────────────────────────────────────────────────────────
+  async getRounds(offerId: string, userId: string) {
+    const offer = await this.prisma.offer.findUnique({ where: { id: offerId }, include: { product: { select: { sellerId: true, unit: true } } } });
     if (!offer) throw new NotFoundException('Offer not found');
-    if (offer.product.sellerId !== sellerId) throw new ForbiddenException('Not your listing');
-    if (offer.status !== OfferStatus.PENDING) throw new BadRequestException('Can only counter pending offers');
-    await this.failIfExpired(offer);
-
-    const countered = await this.prisma.offer.update({
-      where: { id: offerId },
-      data: {
-        status: OfferStatus.COUNTERED,
-        counterPrice: dto.counterPrice,
-        counterMessage: dto.counterMessage,
-        // Give the buyer a fresh window to answer the counter.
-        expiresAt: new Date(Date.now() + OffersService.OFFER_TTL_MS),
-      },
-    });
-    await this.notifications.notify({
-      userId: offer.buyerId,
-      type: NotificationType.OFFER_RECEIVED,
-      title: 'The seller sent a counter-offer',
-      body: `Counter of ₨${Number(dto.counterPrice).toLocaleString()} on ${offer.product.name}. Accept or decline within 72 hours.`,
-      data: { link: '/buyer', offerId },
-    });
-    return countered;
+    if (offer.buyerId !== userId && offer.product.sellerId !== userId) throw new ForbiddenException('Access denied');
+    const rounds = await this.prisma.offerRound.findMany({ where: { offerId }, orderBy: { roundNo: 'asc' } });
+    return rounds.map((r: any) => ({
+      ...r,
+      mine: r.proposerId === userId,
+      termsSummary: describeTerms(r.paymentTerms),
+      total: OffersService.round2(Number(r.price) * r.quantity),
+    }));
   }
 
   async getSellerOffers(sellerId: string) {
     await this.sweepExpired({ product: { sellerId } });
-    return this.prisma.offer.findMany({
+    // Estimate shown on the seller's accept review; the % in force at acceptance is what gets frozen on the order.
+    const platformFeePct = await this.settings.getPlatformFeePct();
+    const offers = await this.prisma.offer.findMany({
       where: { product: { sellerId } },
       include: {
         product: { select: { id: true, name: true, unit: true, askingPrice: true } },
         buyer: { select: { id: true, profile: { select: { fullName: true, city: true } }, kycStatus: true } },
+        rounds: { orderBy: { roundNo: 'asc' } },
       },
       orderBy: { createdAt: 'desc' },
     });
+    return offers.map((o: any) => ({ ...o, platformFeePct }));
   }
 
   async getBuyerOffers(buyerId: string) {
@@ -364,6 +559,7 @@ export class OffersService {
         product: {
           select: { id: true, name: true, unit: true, askingPrice: true, seller: { select: { profile: { select: { fullName: true } } } } },
         },
+        rounds: { orderBy: { roundNo: 'asc' } },
       },
       orderBy: { createdAt: 'desc' },
     });
@@ -468,7 +664,8 @@ export class OrdersService {
     const order = await this.prisma.order.findUnique({
       where: { id: orderId },
       include: {
-        offer: { include: { product: { include: { riceDetails: true, media: { take: 1 } } } } },
+        offer: { include: { product: { include: { riceDetails: true, media: { take: 1 } } }, rounds: { orderBy: { roundNo: 'asc' } } } },
+        sellerInvoices: { orderBy: { issuedAt: 'desc' }, select: { id: true, invoiceNumber: true, status: true, version: true, orderAmount: true, dueDate: true } },
         seller: { select: { profile: true, kycStatus: true } },
         buyer: { select: { profile: true, kycStatus: true } },
         payments: true,
@@ -484,11 +681,24 @@ export class OrdersService {
     });
     if (!order) throw new NotFoundException('Order not found');
     if (order.sellerId !== userId && order.buyerId !== userId) throw new ForbiddenException('Access denied');
-    return order;
+    const terms = (order as any).paymentTermsSnapshot as PaymentTerms | null;
+    return {
+      ...order,
+      paymentTermsSummary: describeTerms(terms),
+      paymentSchedule: computeSchedule(terms, Number(order.totalAmount), contextFromOrder(order as any)),
+    };
   }
 
   // Cancelling an order puts its quantity back on the listing (and
   // re-opens it if that sale had marked it SOLD).
+  // A cancelled order can't be paid: any open invoice is voided with it.
+  private async voidOpenInvoices(tx: any, orderId: string) {
+    await tx.sellerInvoice.updateMany({
+      where: { orderId, status: { in: ['ISSUED', 'PAYMENT_SUBMITTED'] } },
+      data: { status: 'VOID', voidedAt: new Date(), voidReason: 'Order cancelled' },
+    });
+  }
+
   private async restoreStock(tx: any, offer: { productId: string; quantity: number }) {
     await tx.product.update({
       where: { id: offer.productId },
@@ -551,7 +761,8 @@ export class OrdersService {
       });
       if (res.count === 0) throw new BadRequestException('This order was just updated — please refresh and try again');
       await tx.orderStatusHistory.create({ data: { orderId, status, changedBy: userId, note } });
-      if (status === OrderStatus.CANCELLED && order.offer) await this.restoreStock(tx, order.offer);
+      if (status === OrderStatus.CANCELLED && order.offer) await this.restoreStock(tx, { productId: order.offer.productId, quantity: order.quantity ?? order.offer.quantity });
+      if (status === OrderStatus.CANCELLED) await this.voidOpenInvoices(tx, orderId);
       if (status === OrderStatus.COMPLETED) await this.recordSettlement(tx, order);
       return tx.order.findUnique({ where: { id: orderId } });
     });
@@ -562,7 +773,7 @@ export class OrdersService {
       type: NotificationType.ORDER_UPDATE,
       title: `Order ${status.toLowerCase().replace('_', ' ')}`,
       body: `Order ${orderId.slice(0, 8)} is now ${status.replace('_', ' ').toLowerCase()}${note ? ` — ${note}` : ''}.`,
-      data: { link: other === order.buyerId ? '/buyer' : '/seller', orderId },
+      data: destination(other === order.buyerId ? '/buyer' : '/seller', { tab: 'orders', entityType: 'order', entityId: orderId }),
     });
     return updated;
   }
@@ -650,7 +861,8 @@ export class OrdersService {
       await tx.orderStatusHistory.create({
         data: { orderId, status: newStatus, changedBy: adminId, note: `Dispute resolved by admin: ${note}` },
       });
-      if (newStatus === OrderStatus.CANCELLED && order.offer) await this.restoreStock(tx, order.offer);
+      if (newStatus === OrderStatus.CANCELLED && order.offer) await this.restoreStock(tx, { productId: order.offer.productId, quantity: order.quantity ?? order.offer.quantity });
+      if (newStatus === OrderStatus.CANCELLED) await this.voidOpenInvoices(tx, orderId);
       if (newStatus === OrderStatus.COMPLETED) await this.recordSettlement(tx, order);
       return updated;
     });
@@ -660,7 +872,7 @@ export class OrdersService {
       type: NotificationType.ORDER_UPDATE,
       title: 'Dispute resolved',
       body: `An admin resolved the dispute on order ${orderId.slice(0, 8)} as ${resolution}. ${note}`,
-      data: { link: uid === order.buyerId ? '/buyer' : '/seller', orderId },
+      data: destination(uid === order.buyerId ? '/buyer' : '/seller', { tab: 'orders', entityType: 'order', entityId: orderId }),
     })));
     return resolved;
   }

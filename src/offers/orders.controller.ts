@@ -1,18 +1,19 @@
 import { Controller, Get, Patch, Param, Body, Query, UseGuards } from '@nestjs/common';
 import { OrdersService } from './offers.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { RequireApproved } from '../common/guards/approved-user.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { OrderStatus } from '@prisma/client';
 
 @Controller('orders')
-@UseGuards(JwtAuthGuard)
 export class OrdersController {
   constructor(private readonly ordersService: OrdersService) {}
 
   // GET /orders?role=seller|buyer&status=...
   @Get()
+  @UseGuards(JwtAuthGuard)
   findAll(
     @CurrentUser('id') userId: string,
     @Query('role') role: 'seller' | 'buyer' = 'buyer',
@@ -23,7 +24,7 @@ export class OrdersController {
 
   // GET /orders/admin/summary — server-side revenue / status totals
   @Get('admin/summary')
-  @UseGuards(RolesGuard)
+  @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles('ADMIN')
   adminSummary() {
     return this.ordersService.getAdminSummary();
@@ -31,7 +32,7 @@ export class OrdersController {
 
   // GET /orders/admin — admin view all orders
   @Get('admin')
-  @UseGuards(RolesGuard)
+  @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles('ADMIN')
   adminOrders(
     @Query('status') status?: string,
@@ -43,12 +44,14 @@ export class OrdersController {
 
   // GET /orders/:id
   @Get(':id')
+  @UseGuards(JwtAuthGuard)
   findOne(@Param('id') id: string, @CurrentUser('id') userId: string) {
     return this.ordersService.findOne(id, userId);
   }
 
   // PATCH /orders/:id/status
   @Patch(':id/status')
+  @RequireApproved()
   updateStatus(
     @Param('id') id: string,
     @CurrentUser('id') userId: string,
@@ -60,7 +63,7 @@ export class OrdersController {
 
   // PATCH /orders/admin/:id/resolve-dispute
   @Patch('admin/:id/resolve-dispute')
-  @UseGuards(RolesGuard)
+  @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles('ADMIN')
   resolveDispute(
     @Param('id') id: string,

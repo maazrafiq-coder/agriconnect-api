@@ -9,6 +9,8 @@ import { ProductStatus, OrderStatus, NotificationType } from '@prisma/client';
 import { recordAudit } from '../common/utils/audit.util';
 import { NotificationsService } from '../notifications/notifications.service';
 
+import { destination } from '../notifications/destinations';
+import { normalizePaymentTerms } from '../offers/terms/payment-terms';
 @Injectable()
 export class ProductsService {
   constructor(
@@ -31,7 +33,7 @@ export class ProductsService {
 
   // ─── CREATE ───────────────────────────────────────────────────────────────
   async create(sellerId: string, dto: CreateProductDto) {
-    const { riceDetails, ...productData } = dto;
+    const { riceDetails, paymentTerms, ...productData } = dto;
 
     // Category is now admin-managed data, not a hardcoded enum — validate
     // the slug is real and active so listings can't reference a category
@@ -58,6 +60,7 @@ export class ProductsService {
     const product = await this.prisma.product.create({
       data: {
         ...productData,
+        ...(paymentTerms ? { paymentTerms: normalizePaymentTerms(paymentTerms) as any } : {}),
         askingPrice: productData.askingPrice,
         sellerId,
         harvestDate: productData.harvestDate ? new Date(productData.harvestDate) : null,
@@ -299,7 +302,7 @@ export class ProductsService {
       throw new BadRequestException(`A ${product.status.toLowerCase()} listing cannot be edited.`);
     }
 
-    const { riceDetails, ...fields } = dto;
+    const { riceDetails, paymentTerms, ...fields } = dto;
     const nextQty = fields.quantity ?? product.quantity;
     const nextMin = fields.minOrderQty ?? product.minOrderQty;
     if (nextMin > nextQty) {
@@ -310,6 +313,7 @@ export class ProductsService {
       where: { id },
       data: {
         ...fields,
+        ...(paymentTerms ? { paymentTerms: normalizePaymentTerms(paymentTerms) as any } : {}),
         ...(fields.harvestDate && { harvestDate: new Date(fields.harvestDate) }),
         ...(riceDetails && {
           // The listing may have been created without rice quality details.
@@ -515,7 +519,7 @@ export class ProductsService {
       type: NotificationType.SYSTEM,
       title: 'Your listing is live',
       body: `${product.name} was approved and is now visible on the marketplace.`,
-      data: { link: '/seller', productId },
+      data: destination('/seller', { tab: 'listings', entityType: 'listing', entityId: productId }),
     });
     return updated;
   }
@@ -541,7 +545,7 @@ export class ProductsService {
       type: NotificationType.SYSTEM,
       title: 'Your listing needs changes',
       body: `${product.name} was not approved: ${reason}. Edit it and save to resubmit.`,
-      data: { link: '/seller', productId },
+      data: destination('/seller', { tab: 'listings', entityType: 'listing', entityId: productId }),
     });
     return updated;
   }

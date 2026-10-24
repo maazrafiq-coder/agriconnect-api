@@ -67,13 +67,24 @@ describe('AuthService - Milestone 1 hardening', () => {
       expect(prisma.refreshToken.create).not.toHaveBeenCalled();
     });
 
-    it('refuses to refresh for a REJECTED user', async () => {
+    it('refuses to refresh for a PENDING (OTP-unverified) user', async () => {
       prisma.refreshToken.findUnique.mockResolvedValue({
         id: 'r1', userId: 'u1', isRevoked: false, expiresAt: new Date(Date.now() + 1e6),
-        user: user({ kycStatus: 'REJECTED' }),
+        user: user({ kycStatus: 'PENDING' }),
       });
       await expect(service.refreshToken('raw')).rejects.toThrow(UnauthorizedException);
     });
+
+    it.each(['SUBMITTED', 'RECOMMENDED', 'INFO_REQUESTED', 'REJECTED'])(
+      'refreshes a limited session for a %s user (transactions stay blocked by ApprovedUserGuard)',
+      async (kycStatus) => {
+        prisma.refreshToken.findUnique.mockResolvedValue({
+          id: 'r1', userId: 'u1', isRevoked: false, expiresAt: new Date(Date.now() + 1e6),
+          user: user({ kycStatus }),
+        });
+        await expect(service.refreshToken('raw')).resolves.toBeDefined();
+      },
+    );
 
     it('rotates a valid token for an active user', async () => {
       prisma.refreshToken.findUnique.mockResolvedValue({

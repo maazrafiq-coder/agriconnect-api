@@ -45,6 +45,7 @@ describe('OrdersService — status lifecycle', () => {
       orderStatusHistory: {
         create: jest.fn().mockResolvedValue({}),
       },
+      sellerInvoice: { updateMany: jest.fn().mockResolvedValue({ count: 0 }) },
       product: {
         update: jest.fn().mockResolvedValue({}),
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
@@ -62,6 +63,20 @@ describe('OrdersService — status lifecycle', () => {
     }).compile();
 
     service = moduleRef.get(OrdersService);
+  });
+
+  it('cancelling an order voids its open (unpaid) seller invoices in the same transaction', async () => {
+    await service.updateStatus('order-1', 'buyer-1', OrderStatus.CANCELLED, 'changed my mind');
+    expect(prisma.sellerInvoice.updateMany).toHaveBeenCalledWith({
+      where: { orderId: 'order-1', status: { in: ['ISSUED', 'PAYMENT_SUBMITTED'] } },
+      data: expect.objectContaining({ status: 'VOID', voidReason: 'Order cancelled' }),
+    });
+  });
+
+  it('restores the AGREED quantity (not the original offer quantity) when a negotiated order is cancelled', async () => {
+    stored = { ...baseOrder, quantity: 25 };
+    await service.updateStatus('order-1', 'seller-1', OrderStatus.CANCELLED, 'out of stock really');
+    expect(prisma.product.update).toHaveBeenCalledWith({ where: { id: 'prod-1' }, data: { quantity: { increment: 25 } } });
   });
 
   it('lets the seller move CONFIRMED -> IN_TRANSIT', async () => {

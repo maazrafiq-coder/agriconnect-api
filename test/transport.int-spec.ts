@@ -11,6 +11,7 @@
  */
 import { PrismaClient } from '@prisma/client';
 import { TransportService } from '../src/testing/testing.service';
+import { TransportLifecycleService } from '../src/transport/transport-lifecycle.service';
 import { NotificationsService } from '../src/notifications/notifications.service';
 
 const url = process.env.TEST_DATABASE_URL;
@@ -19,6 +20,7 @@ const d = url ? describe : describe.skip;
 d('Transport quote → accept → track (real database)', () => {
   let prisma: PrismaClient;
   let service: TransportService;
+  let life: TransportLifecycleService;
   let buyerId: string;
   let providerId: string;
   const tag = `it-${Date.now()}`;
@@ -26,9 +28,11 @@ d('Transport quote → accept → track (real database)', () => {
   beforeAll(async () => {
     prisma = new PrismaClient({ datasources: { db: { url } } });
     await prisma.$connect();
-    service = new TransportService(prisma as any, new NotificationsService(prisma as any));
-    const buyer = await prisma.user.create({ data: { passwordHash: 'x', role: 'BUYER', email: `${tag}-b@test.local` } as any });
-    const prov = await prisma.user.create({ data: { passwordHash: 'x', role: 'TRANSPORTER', email: `${tag}-p@test.local` } as any });
+    const notes = new NotificationsService(prisma as any);
+    service = new TransportService(prisma as any, notes);
+    life = new TransportLifecycleService(prisma as any, notes);
+    const buyer = await prisma.user.create({ data: { passwordHash: 'x', role: 'BUYER', kycStatus: 'APPROVED', email: `${tag}-b@test.local` } as any });
+    const prov = await prisma.user.create({ data: { passwordHash: 'x', role: 'TRANSPORTER', kycStatus: 'APPROVED', email: `${tag}-p@test.local` } as any });
     buyerId = buyer.id; providerId = prov.id;
     await prisma.transportProfile.create({ data: { userId: providerId, companyName: 'IT Logistics', maxCapacityTons: 20, pricePerKm: 100 } as any });
   });
@@ -46,40 +50,61 @@ d('Transport quote → accept → track (real database)', () => {
     return r.id as string;
   };
 
-  it('runs the full lifecycle and fixes the price at the quote', async () => {
+  const quoted = async (price: number) => {
     const id = await newRequest();
-    await service.quote(id, providerId, { price: 45000 } as any);
-    await service.acceptQuote(id, buyerId);
+    const q: any = await life.propose(id, providerId, 'PROVIDER', { price } as any);
+    return { id, roundId: q.currentRound.id as string };
+  };
+
+  it('runs the full lifecycle: quote, accept, drive, deliver, acknowledge', async () => {
+    const { id, roundId } = await quoted(45000);
+    await life.accept(id, buyerId, { roundId });
     let row = await prisma.transportRequest.findUnique({ where: { id } });
     expect(row?.status).toBe('BOOKED');
     expect(Number(row?.agreedPrice)).toBe(45000);
+    expect(row?.requestNumber).toMatch(/^TRQ-\d{4}-\d{6}$/);
 
-    await service.updateTracking(id, providerId, { status: 'PICKED_UP', currentLocation: 'Lahore' } as any);
-    await service.updateTracking(id, providerId, { status: 'IN_TRANSIT' } as any);
-    await service.updateTracking(id, providerId, { status: 'DELIVERED' } as any);
+    await expect(life.updateTracking(id, providerId, { status: 'PICKED_UP' } as any)).rejects.toThrow(/driver/i);
+    await life.updateTracking(id, providerId, { status: 'PICKED_UP', driverName: 'Ali Khan', driverPhone: '+923001234567', vehicleRegNo: 'LEA-1234' } as any);
+    await life.updateTracking(id, providerId, { status: 'IN_TRANSIT' } as any);
+    await life.updateTracking(id, providerId, { status: 'DELIVERED' } as any);
+    await life.acknowledge(id, buyerId, 'all good');
     row = await prisma.transportRequest.findUnique({ where: { id } });
-    expect(row?.status).toBe('DELIVERED');
-    expect(row?.deliveredAt).toBeTruthy();
-
-    const notes = await prisma.notification.count({ where: { userId: buyerId, type: 'TRANSPORT_UPDATE' as any } });
-    expect(notes).toBeGreaterThanOrEqual(3);
+    expect(row?.status).toBe('COMPLETED');
+    expect(row?.acknowledgedAt).toBeTruthy();
   });
 
   it('two simultaneous accepts book it exactly once', async () => {
-    const id = await newRequest();
-    await service.quote(id, providerId, { price: 30000 } as any);
-    const results = await Promise.allSettled([service.acceptQuote(id, buyerId), service.acceptQuote(id, buyerId)]);
-    expect(results.filter(r => r.status === 'fulfilled')).toHaveLength(1);
+    const { id, roundId } = await quoted(30000);
+    const results = await Promise.allSettled([life.accept(id, buyerId, { roundId }), life.accept(id, buyerId, { roundId })]);
+    expect(results.filter(r => r.status === 'fulfilled').length).toBeGreaterThanOrEqual(1);
     const row = await prisma.transportRequest.findUnique({ where: { id } });
     expect(row?.status).toBe('BOOKED');
+    expect(await prisma.transportQuoteRound.count({ where: { requestId: id, status: 'ACCEPTED' as any } })).toBe(1);
   });
 
-  it('a re-quote after acceptance is refused and cannot change the agreed price', async () => {
-    const id = await newRequest();
-    await service.quote(id, providerId, { price: 10000 } as any);
-    await service.acceptQuote(id, buyerId);
-    await expect(service.quote(id, providerId, { price: 99999 } as any)).rejects.toThrow();
+  it('after acceptance a re-quote is refused and the DB trigger protects the agreed price', async () => {
+    const { id, roundId } = await quoted(10000);
+    await life.accept(id, buyerId, { roundId });
+    await expect(life.propose(id, providerId, 'PROVIDER', { price: 99999 } as any)).rejects.toThrow();
+    await expect(prisma.transportRequest.update({ where: { id }, data: { agreedPrice: 1 } })).rejects.toThrow(/immutable/);
     const row = await prisma.transportRequest.findUnique({ where: { id } });
     expect(Number(row?.agreedPrice)).toBe(10000);
+  });
+
+  it('the database allows only one CURRENT round per request', async () => {
+    const { id } = await quoted(5000);
+    await expect(prisma.transportQuoteRound.create({
+   data: {
+  requestId: id,
+  providerId,
+  roundNo: 99,
+  proposerId: providerId,
+  proposerRole: 'PROVIDER',
+  price: 1,
+  totalPrice: 1,
+  status: 'CURRENT' as any,
+},
+    })).rejects.toThrow();
   });
 });

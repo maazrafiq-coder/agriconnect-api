@@ -1,7 +1,7 @@
 // ─── DTOs ─────────────────────────────────────────────────────────────────────
 import {
   IsString, IsNumber, IsOptional, IsEnum, IsBoolean,
-  IsDateString, IsArray, Min, ValidateNested,
+  IsDateString, IsArray, Min, ValidateNested, IsObject,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { RiceStage } from '@prisma/client';
@@ -84,6 +84,10 @@ export class CreateProductDto {
   @IsOptional() @IsString()
   deliveryTerms?: string;
 
+  // Default payment terms for this listing (validated by normalizePaymentTerms).
+  @IsOptional() @IsObject()
+  paymentTerms?: any;
+
   @IsOptional()
   @ValidateNested()
   @Type(() => RiceDetailDto)
@@ -122,6 +126,9 @@ export class UpdateProductDto {
 
   @IsOptional() @IsString()
   deliveryTerms?: string;
+
+  @IsOptional() @IsObject()
+  paymentTerms?: any;
 
   @IsOptional()
   @ValidateNested()

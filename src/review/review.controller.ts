@@ -1,6 +1,6 @@
 // src/review/review.controller.ts
 import {
-  Controller, Get, Post, Patch, Param, Body, Query, UseGuards,
+  Controller, Get, Post, Patch, Param, Body, Query, UseGuards, Headers,
   UseInterceptors, UploadedFiles, Res,
 } from '@nestjs/common';
 import { FilesInterceptor } from '@nestjs/platform-express';
@@ -71,7 +71,10 @@ export class ReviewController {
     @CurrentUser('role') role: string,
     @Body() dto: RespondClarificationDto,
     @UploadedFiles() files: Array<{ originalname: string; filename: string }>,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
+    // The key can arrive as a header or a form field; the header wins.
+    if (idempotencyKey && /^[A-Za-z0-9_-]{1,100}$/.test(idempotencyKey)) dto.clientRequestId = idempotencyKey;
     return this.reviewService.respondToClarification(userId, role, id, dto, files || []);
   }
 

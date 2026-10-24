@@ -46,8 +46,18 @@ describe('JwtStrategy.validate', () => {
     await expect(strategy.validate({ sub: 'u1' })).rejects.toThrow(UnauthorizedException);
   });
 
-  it.each(['PENDING', 'SUBMITTED', 'RECOMMENDED', 'REJECTED'])('rejects kycStatus %s', async (kycStatus) => {
+  it('rejects kycStatus PENDING (OTP never verified - registration token only)', async () => {
+    prisma.user.findUnique.mockResolvedValue({ ...activeUser, kycStatus: 'PENDING' });
+    await expect(strategy.validate({ sub: 'u1' })).rejects.toThrow(UnauthorizedException);
+  });
+
+  it.each(['SUBMITTED', 'RECOMMENDED', 'REJECTED'])('allows a LIMITED session for kycStatus %s', async (kycStatus) => {
     prisma.user.findUnique.mockResolvedValue({ ...activeUser, kycStatus });
+    await expect(strategy.validate({ sub: 'u1' })).resolves.toMatchObject({ kycStatus });
+  });
+
+  it.each(['SUBMITTED', 'RECOMMENDED', 'REJECTED', 'INFO_REQUESTED'])('still blocks a suspended user with kycStatus %s', async (kycStatus) => {
+    prisma.user.findUnique.mockResolvedValue({ ...activeUser, kycStatus, isActive: false });
     await expect(strategy.validate({ sub: 'u1' })).rejects.toThrow(UnauthorizedException);
   });
 

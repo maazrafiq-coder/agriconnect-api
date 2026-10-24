@@ -4,10 +4,20 @@ import { ExtractJwt, Strategy } from 'passport-jwt';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../../prisma/prisma.service';
 
-// Accounts in these KYC states may hold a normal session. INFO_REQUESTED is
-// included on purpose: the user must be able to log in to answer the
-// admin's request (they just can't transact - see ApprovedUserGuard).
-export const SESSION_ALLOWED_KYC = ['APPROVED', 'INFO_REQUESTED'];
+// Accounts in these KYC states may hold a session.
+//
+// Only APPROVED accounts may TRANSACT (see ApprovedUserGuard). Every other
+// state here is a deliberately LIMITED session: the person can browse the
+// public marketplace, see their account/KYC status, upload or replace
+// documents and answer the admin's clarification requests - nothing that
+// creates or changes a commercial record.
+//   SUBMITTED / RECOMMENDED - registered, waiting for admin approval
+//   INFO_REQUESTED          - admin asked for more information
+//   REJECTED                - must see the reason and can re-submit documents
+// PENDING (OTP not yet verified) is NOT here: that person only holds a
+// registration token. Suspended accounts (isActive=false) are blocked
+// separately, whatever their kycStatus.
+export const SESSION_ALLOWED_KYC = ['APPROVED', 'INFO_REQUESTED', 'SUBMITTED', 'RECOMMENDED', 'REJECTED'];
 
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy) {
