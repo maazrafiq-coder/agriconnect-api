@@ -6,6 +6,7 @@ import * as compression from 'compression';
 import * as cookieParser from 'cookie-parser';
 import { mkdirSync } from 'fs';
 import { AppModule } from './app.module';
+import { buildCorsOptions } from './config/cors.config';
 import { appLogger } from './common/logging/app-logger';
 import { requestIdMiddleware } from './common/logging/request-id.middleware';
 import { initSentry } from './common/observability/sentry';
@@ -45,11 +46,8 @@ async function bootstrap() {
 
   // ─── CORS ────────────────────────────────────────────────────────────────
   app.enableCors({
-    origin: process.env.FRONTEND_URL || 'http://localhost:5173',
-    methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    ...buildCorsOptions(process.env.FRONTEND_URL),
     exposedHeaders: ['X-Request-Id'],
-    credentials: true, // required so the httpOnly refresh-token cookie is sent/received
   });
 
   // ─── GLOBAL PREFIX ────────────────────────────────────────────────────────
